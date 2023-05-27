@@ -1,0 +1,22 @@
+[package]
+name = "pgpubsub"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Async PostgreSQL LISTEN/NOTIFY pub/sub client built on tokio-postgres"
+repository = "https://github.com/mrcz/pgpubsub"
+keywords = ["postgres", "pubsub", "listen", "notify", "tokio"]
+categories = ["database", "asynchronous"]
+exclude = [".vscode/"]
+
+[dependencies]
+async-task-group = "0.2.1"
+dashmap = "6.1.0"
+either = "1.15.0"
+futures-concurrency = "7.7.1"
+futures-util = "0.3.32"
+log = "0.4.29"
+postgres-protocol = "0.6.11"
+rand = { version = "0.10.0", default-features = false, features = ["std", "sys_rng"] }
+tokio = { version = "1.50.0", features = ["rt", "time"] }
+tokio-postgres = "0.7.17"
