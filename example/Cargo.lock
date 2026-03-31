@@ -802,7 +802,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgpubsub"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-task-group",
  "dashmap",
