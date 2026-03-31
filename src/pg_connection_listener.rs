@@ -1,4 +1,4 @@
-use std::{future::poll_fn, sync::Arc};
+use std::{future::poll_fn, sync::atomic::Ordering, sync::Arc};
 
 use dashmap::DashMap;
 use either::Either;
@@ -166,30 +166,26 @@ pub(crate) async fn spawn_unsubscription_task(
     // Spawn a task to handle unsubscriptions from channels.
     tokio::spawn(async move {
         while let Some(channel) = unsub_rx.recv().await {
-            let mut no_listeners_remaining = false;
             if let Some(listener) = unsub_listener_map.get(&channel) {
-                let mut listener_count = listener.listener_count.lock().await;
-                assert!(*listener_count > 0);
-                *listener_count -= 1;
-                if *listener_count == 0 {
-                    no_listeners_remaining = true;
-                    // All listeners for this channel have been removed. Send an UNLISTEN command to
-                    // postgres.
-                    log::debug!("Unlistening to {channel}");
-                    if let Err(err) = pg_client.unlisten(&channel).await {
-                        log::error!("Error when unlistening: {err:?}");
+                let prev = listener.listener_count.fetch_sub(1, Ordering::AcqRel);
+                assert!(prev > 0);
+                if prev == 1 {
+                    // Last listener removed. Drop the read ref before trying to remove.
+                    drop(listener);
+                    // Remove the entry only if the count is still 0. This guards against
+                    // a concurrent listen() that re-subscribed between our fetch_sub and
+                    // this remove. DashMap holds its shard lock during remove_if, so
+                    // listen()'s entry() call cannot interleave with this check.
+                    let removed = unsub_listener_map.remove_if(&channel, |_key, listener| {
+                        listener.listener_count.load(Ordering::Acquire) == 0
+                    });
+                    if removed.is_some() {
+                        // Entry was removed, so no active listeners. Send UNLISTEN.
+                        log::debug!("Unlistening from {channel}");
+                        if let Err(err) = pg_client.unlisten(&channel).await {
+                            log::error!("Error when unlistening: {err:?}");
+                        }
                     }
-                }
-            }
-            if no_listeners_remaining {
-                let removed = unsub_listener_map.remove_if(&channel, |_key, listener| {
-                    listener
-                        .listener_count
-                        .try_lock()
-                        .map_or(false, |count| *count == 0)
-                });
-                if removed.is_some() {
-                    log::debug!("Removing listener for {channel}");
                 }
             }
         }

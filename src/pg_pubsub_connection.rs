@@ -3,9 +3,10 @@ use crate::pg_connection_listener::{spawn_listener_task, spawn_unsubscription_ta
 use crate::tokio_postgres::{MakeTlsConnect, Socket};
 use async_task_group::{GroupJoinHandle, TaskGroup};
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc};
 
 use tokio_postgres::{connect, Error};
 
@@ -33,7 +34,7 @@ pub struct Notification {
 
 pub(crate) struct Listener {
     pub send_channel: broadcast::Sender<Notification>,
-    pub listener_count: Mutex<usize>,
+    pub listener_count: AtomicUsize,
 }
 
 pub struct Subscription {
@@ -167,7 +168,7 @@ impl PgPubSubConnection {
             new_channel = true;
             Listener {
                 send_channel: sender,
-                listener_count: Mutex::new(1),
+                listener_count: AtomicUsize::new(1),
             }
         });
 
@@ -176,10 +177,7 @@ impl PgPubSubConnection {
             self.listen_cmd(channel).await?;
         } else {
             // The channel already existed, increment the listener count.
-            let mut listener_count = listener.listener_count.lock().await;
-            *listener_count = listener_count
-                .checked_add(1)
-                .expect("listener_count overflow");
+            listener.listener_count.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(Subscription {
