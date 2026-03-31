@@ -37,6 +37,12 @@ pub(crate) struct Listener {
     pub listener_count: AtomicUsize,
 }
 
+/// A subscription to a PostgreSQL notification channel.
+///
+/// Receives notifications via [`recv`](Subscription::recv). Automatically sends an UNLISTEN
+/// command when all subscriptions for a channel are dropped.
+///
+/// This type is `Send + 'static` and can be used with `tokio::spawn`.
 pub struct Subscription {
     channel: String,
     receiver: broadcast::Receiver<Notification>,
@@ -44,6 +50,7 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Waits for the next notification on this channel.
     pub async fn recv(&mut self) -> Result<Notification, broadcast::error::RecvError> {
         self.receiver.recv().await
     }
@@ -58,11 +65,16 @@ impl Drop for Subscription {
     }
 }
 
+/// Errors returned by [`PgPubSub`](crate::PgPubSub) operations.
 #[derive(Debug)]
 pub enum PubSubError {
+    /// An error from the underlying `tokio_postgres` connection.
     TokioPostgresError(tokio_postgres::Error),
+    /// Failed to send a LISTEN command.
     SendError,
+    /// Channel name is empty or exceeds 63 bytes.
     InvalidChannelName,
+    /// Failed to send a NOTIFY command.
     NotifyError,
 }
 
