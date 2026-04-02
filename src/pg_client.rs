@@ -2,30 +2,28 @@ use postgres_protocol::escape::{escape_identifier, escape_literal};
 use tokio_postgres::Client;
 
 /// PgClient implements an interface to send LISTEN, UNLISTEN and NOTIFY commands to a PostgreSQL
-/// server. LISTEN and NOTIFY don't work with prepared statements so we create the queries ourselves
-/// and send without parameters.
+/// server.
 pub(crate) struct PgClient {
     client: Client,
 }
 
 impl PgClient {
-    /// Creates a new PgClient with the default buffer size.
     pub fn new(client: Client) -> Self {
         Self { client }
     }
 
     /// Listens to a channel.
-    pub async fn listen(&self, channel: &str) -> Result<u64, crate::tokio_postgres::Error> {
+    pub async fn listen(&self, channel: &str) -> Result<(), crate::tokio_postgres::Error> {
         let channel = escape_identifier(channel);
-        let listen_cmd = format!("LISTEN {channel}");
-        self.client.execute(&listen_cmd, &[]).await
+        self.client.execute(&format!("LISTEN {channel}"), &[]).await?;
+        Ok(())
     }
 
     /// Unlistens from a channel.
-    pub async fn unlisten(&self, channel: &str) -> Result<u64, crate::tokio_postgres::Error> {
+    pub async fn unlisten(&self, channel: &str) -> Result<(), crate::tokio_postgres::Error> {
         let channel = escape_identifier(channel);
-        let unlisten_cmd = format!("UNLISTEN {channel}");
-        self.client.execute(&unlisten_cmd, &[]).await
+        self.client.execute(&format!("UNLISTEN {channel}"), &[]).await?;
+        Ok(())
     }
 
     /// Sends a notification to a channel.
@@ -33,16 +31,17 @@ impl PgClient {
         &self,
         channel: &str,
         payload: Option<&str>,
-    ) -> Result<u64, crate::tokio_postgres::Error> {
+    ) -> Result<(), crate::tokio_postgres::Error> {
         let channel = escape_identifier(channel);
-        let notify_cmd = match payload {
+        let cmd = match payload {
             Some(payload) => {
                 let payload = escape_literal(payload);
                 format!("NOTIFY {channel}, {payload}")
             }
             None => format!("NOTIFY {channel}"),
         };
-        self.client.execute(&notify_cmd, &[]).await
+        self.client.execute(&cmd, &[]).await?;
+        Ok(())
     }
 
     /// Returns the PostgreSQL process id of this connection.

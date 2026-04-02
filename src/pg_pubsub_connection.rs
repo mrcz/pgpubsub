@@ -1,5 +1,5 @@
 use crate::exponential_backoff::{ExponentialBackoff, SharedExponentialBackoff};
-use crate::pg_connection_listener::{spawn_listener_task, spawn_unsubscription_task};
+use crate::pg_connection_listener::{create_listener_task, unsubscription_task};
 use crate::tokio_postgres::{MakeTlsConnect, Socket};
 use async_task_group::{GroupJoinHandle, TaskGroup};
 use dashmap::DashMap;
@@ -137,21 +137,26 @@ impl PgPubSubConnection {
 
         let (unsub_tx, unsub_rx) = mpsc::channel(options.channel_capacity);
 
+        let (listener_future, backend_pid_sx) = create_listener_task::<T>(
+            connection,
+            listener_map2,
+            options.suppress_own_notifications,
+            backoff,
+            disconnected_sx,
+            disconnected_rx,
+        );
+
         let group_handle = async_task_group::group(|group: TaskGroup<Error>| async move {
-            group.spawn(
-                spawn_listener_task::<T>(
-                    connection,
-                    pg_client2,
-                    listener_map2,
-                    options.suppress_own_notifications,
-                    backoff,
-                    disconnected_sx,
-                    disconnected_rx,
-                )
-                .await?,
-            );
+            // Spawn the connection polling loop first so the connection is driven.
+            group.spawn(listener_future);
+            // Now that the connection is being polled, we can query for the backend PID.
+            if let Some(pid_sx) = backend_pid_sx {
+                pid_sx
+                    .send(pg_client2.get_pid().await?)
+                    .expect("listener task is running, oneshot should be open");
+            }
             group.spawn(async {
-                spawn_unsubscription_task(unsub_rx, listener_map3, pg_client3).await;
+                unsubscription_task(unsub_rx, listener_map3, pg_client3).await;
                 Ok(())
             });
             Ok(group)
