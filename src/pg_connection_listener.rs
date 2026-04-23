@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use either::Either;
 use futures_concurrency::future::Race;
 use futures_util::Future;
-use tokio::sync::{broadcast, mpsc::Receiver, oneshot};
+use tokio::sync::{broadcast, mpsc::UnboundedReceiver, oneshot};
 use tokio_postgres::{tls::MakeTlsConnect, AsyncMessage, Connection, Socket};
 
 use crate::{
@@ -149,7 +149,7 @@ where
 }
 
 pub(crate) async fn unsubscription_task(
-    mut unsub_rx: Receiver<Box<str>>,
+    mut unsub_rx: UnboundedReceiver<Box<str>>,
     unsub_listener_map: Arc<DashMap<Box<str>, Listener>>,
     pg_client: Arc<PgClient>,
 ) {

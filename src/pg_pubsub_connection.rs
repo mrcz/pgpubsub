@@ -17,7 +17,7 @@ pub struct PgPubSubConnection {
     pg_client: Arc<PgClient>,
     listeners: Arc<DashMap<Box<str>, Listener>>,
     channel_capacity: usize,
-    unsub_tx: mpsc::Sender<Box<str>>,
+    unsub_tx: mpsc::UnboundedSender<Box<str>>,
     #[allow(unused)] // held to keep the background tasks alive
     group_handle: GroupJoinHandle<Error>,
 }
@@ -46,7 +46,7 @@ pub(crate) struct Listener {
 pub struct Subscription {
     channel: String,
     receiver: broadcast::Receiver<Notification>,
-    unsub_tx: mpsc::Sender<Box<str>>,
+    unsub_tx: mpsc::UnboundedSender<Box<str>>,
 }
 
 impl Subscription {
@@ -59,7 +59,7 @@ impl Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         log::debug!("Unsubscribing from channel {channel}", channel = self.channel);
-        if let Err(err) = self.unsub_tx.try_send(self.channel.as_str().into()) {
+        if let Err(err) = self.unsub_tx.send(self.channel.as_str().into()) {
             log::error!("Error when unsubscribing: {err}");
         }
     }
@@ -135,7 +135,7 @@ impl PgPubSubConnection {
         let listener_map2 = Arc::clone(&listener_map);
         let listener_map3 = Arc::clone(&listener_map);
 
-        let (unsub_tx, unsub_rx) = mpsc::channel(options.channel_capacity);
+        let (unsub_tx, unsub_rx) = mpsc::unbounded_channel();
 
         let (listener_future, backend_pid_sx) = create_listener_task::<T>(
             connection,
@@ -234,7 +234,7 @@ impl PgPubSubConnection {
                 // Roll back by routing through the unsubscription task: it will decrement the
                 // refcount and, if it reaches zero, remove the entry and best-effort UNLISTEN
                 // in case LISTEN partially succeeded.
-                if let Err(send_err) = self.unsub_tx.try_send(key) {
+                if let Err(send_err) = self.unsub_tx.send(key) {
                     log::error!("Failed to roll back listener after LISTEN error: {send_err}");
                 }
                 return Err(err);
