@@ -178,28 +178,40 @@ impl PgPubSubConnection {
             return Err(PubSubError::InvalidChannelName);
         }
 
-        let mut new_channel = false;
+        let key: Box<str> = channel.into();
 
-        let listener = self.listeners.entry(channel.into()).or_insert_with(|| {
-            let (sender, _receiver) = broadcast::channel(self.channel_capacity);
-            new_channel = true;
-            Listener {
-                send_channel: sender,
-                listener_count: AtomicUsize::new(1),
+        // Insert-or-update the listener entry and subscribe before issuing LISTEN, so a
+        // notification that arrives between the LISTEN response and this function returning is
+        // delivered to at least one receiver. The shard guard is released before the await
+        // below so concurrent operations on the same shard are not blocked on the round-trip.
+        let (receiver, is_new) = {
+            let entry = self.listeners.entry(key.clone()).or_insert_with(|| {
+                let (sender, _receiver) = broadcast::channel(self.channel_capacity);
+                Listener {
+                    send_channel: sender,
+                    listener_count: AtomicUsize::new(0),
+                }
+            });
+            let prev = entry.listener_count.fetch_add(1, Ordering::Relaxed);
+            let receiver = entry.send_channel.subscribe();
+            (receiver, prev == 0)
+        };
+
+        if is_new {
+            if let Err(err) = self.listen_cmd(channel).await {
+                // Roll back by routing through the unsubscription task: it will decrement the
+                // refcount and, if it reaches zero, remove the entry and best-effort UNLISTEN
+                // in case LISTEN partially succeeded.
+                if let Err(send_err) = self.unsub_tx.try_send(key) {
+                    log::error!("Failed to roll back listener after LISTEN error: {send_err}");
+                }
+                return Err(err);
             }
-        });
-
-        if new_channel {
-            // This is a new channel, send a LISTEN command to postgres.
-            self.listen_cmd(channel).await?;
-        } else {
-            // The channel already existed, increment the listener count.
-            listener.listener_count.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(Subscription {
             channel: channel.into(),
-            receiver: listener.send_channel.subscribe(),
+            receiver,
             unsub_tx: self.unsub_tx.clone(),
         })
     }
