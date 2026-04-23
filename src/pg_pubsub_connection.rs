@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use tokio_postgres::{connect, Error};
 
@@ -146,21 +146,53 @@ impl PgPubSubConnection {
             disconnected_rx,
         );
 
+        // The group closure runs asynchronously, so errors inside it don't naturally propagate
+        // out of connect(). We use a oneshot to surface the bootstrap result back here, so a
+        // failed get_pid() fails connect() instead of silently handing out a broken PgPubSub.
+        let (bootstrap_tx, bootstrap_rx) = oneshot::channel::<Result<(), Error>>();
+
         let group_handle = async_task_group::group(|group: TaskGroup<Error>| async move {
             // Spawn the connection polling loop first so the connection is driven.
             group.spawn(listener_future);
             // Now that the connection is being polled, we can query for the backend PID.
             if let Some(pid_sx) = backend_pid_sx {
-                pid_sx
-                    .send(pg_client2.get_pid().await?)
-                    .expect("listener task is running, oneshot should be open");
+                match pg_client2.get_pid().await {
+                    Ok(pid) => {
+                        if pid_sx.send(pid).is_err() {
+                            log::warn!("Listener exited before backend PID was sent");
+                        }
+                    }
+                    Err(err) => {
+                        // Report the failure back to connect() and stop bootstrapping; dropping
+                        // group_handle on the caller side will cancel the listener.
+                        let _ = bootstrap_tx.send(Err(err));
+                        return Ok(group);
+                    }
+                }
             }
+            let _ = bootstrap_tx.send(Ok(()));
             group.spawn(async {
                 unsubscription_task(unsub_rx, listener_map3, pg_client3).await;
                 Ok(())
             });
             Ok(group)
         });
+
+        // Wait for bootstrap to complete before returning a handle to the user. If it failed,
+        // drop group_handle so the spawned listener task is cancelled.
+        match bootstrap_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                drop(group_handle);
+                return Err(err);
+            }
+            Err(_) => {
+                // Sender dropped without sending (group closure panicked or was cancelled).
+                // There's no good error to synthesize here, so log and fall through — the group
+                // is already dead, so the user will see failures on the first listen/notify.
+                log::error!("PgPubSub bootstrap did not complete");
+            }
+        }
 
         let service = PgPubSubConnection {
             pg_client,
