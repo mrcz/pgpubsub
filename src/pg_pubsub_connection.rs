@@ -67,24 +67,22 @@ impl Drop for Subscription {
 
 /// Errors returned by [`PgPubSub`](crate::PgPubSub) operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PubSubError {
-    /// An error from the underlying `tokio_postgres` connection.
-    TokioPostgresError(tokio_postgres::Error),
-    /// Failed to send a LISTEN command.
-    SendError,
     /// Channel name is empty or exceeds 63 bytes.
     InvalidChannelName,
+    /// Failed to send a LISTEN command.
+    SendError(tokio_postgres::Error),
     /// Failed to send a NOTIFY command.
-    NotifyError,
+    NotifyError(tokio_postgres::Error),
 }
 
 impl std::fmt::Display for PubSubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PubSubError::TokioPostgresError(e) => write!(f, "postgres error: {e}"),
-            PubSubError::SendError => write!(f, "failed to send LISTEN command"),
             PubSubError::InvalidChannelName => write!(f, "invalid channel name"),
-            PubSubError::NotifyError => write!(f, "failed to send NOTIFY command"),
+            PubSubError::SendError(e) => write!(f, "failed to send LISTEN command: {e}"),
+            PubSubError::NotifyError(e) => write!(f, "failed to send NOTIFY command: {e}"),
         }
     }
 }
@@ -92,15 +90,9 @@ impl std::fmt::Display for PubSubError {
 impl std::error::Error for PubSubError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PubSubError::TokioPostgresError(e) => Some(e),
-            _ => None,
+            PubSubError::SendError(e) | PubSubError::NotifyError(e) => Some(e),
+            PubSubError::InvalidChannelName => None,
         }
-    }
-}
-
-impl From<tokio_postgres::Error> for PubSubError {
-    fn from(value: tokio_postgres::Error) -> Self {
-        PubSubError::TokioPostgresError(value)
     }
 }
 
@@ -254,11 +246,10 @@ impl PgPubSubConnection {
 
     async fn listen_cmd(&self, channel: &str) -> Result<(), PubSubError> {
         log::debug!("Listening to channel {channel}");
-        if let Err(err) = self.pg_client.listen(channel).await {
-            log::error!("Error on LISTEN: {err:?}");
-            return Err(PubSubError::SendError);
-        }
-        Ok(())
+        self.pg_client
+            .listen(channel)
+            .await
+            .map_err(PubSubError::SendError)
     }
 
     async fn notify_cmd(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {
@@ -266,11 +257,10 @@ impl PgPubSubConnection {
             "Notifying on channel {channel} and payload {payload_str}",
             payload_str = payload.unwrap_or_default()
         );
-        if let Err(err) = self.pg_client.notify(channel, payload).await {
-            log::error!("Error on NOTIFY: {err:?}");
-            return Err(PubSubError::NotifyError);
-        }
-        Ok(())
+        self.pg_client
+            .notify(channel, payload)
+            .await
+            .map_err(PubSubError::NotifyError)
     }
 
     fn valid_channel_name(&self, channel: &str) -> bool {
