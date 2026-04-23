@@ -3,27 +3,6 @@ use std::time::Duration;
 
 use rand::rngs::SmallRng;
 use rand::RngExt;
-use tokio::sync::Mutex;
-
-pub struct SharedExponentialBackoff {
-    backoff: Mutex<ExponentialBackoff>,
-}
-
-impl SharedExponentialBackoff {
-    pub fn new(backoff: ExponentialBackoff) -> Self {
-        Self {
-            backoff: Mutex::new(backoff),
-        }
-    }
-
-    pub async fn fail_and_sleep(&self) {
-        self.backoff.lock().await.fail_and_sleep().await;
-    }
-
-    pub async fn reset(&self) {
-        self.backoff.lock().await.reset();
-    }
-}
 
 pub struct ExponentialBackoff {
     start_duration: f32,

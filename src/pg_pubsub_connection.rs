@@ -1,4 +1,4 @@
-use crate::exponential_backoff::{ExponentialBackoff, SharedExponentialBackoff};
+use crate::exponential_backoff::ExponentialBackoff;
 use crate::pg_connection_listener::{create_listener_task, unsubscription_task};
 use crate::tokio_postgres::{MakeTlsConnect, Socket};
 use async_task_group::{GroupJoinHandle, TaskGroup};
@@ -117,11 +117,11 @@ impl PgPubSubConnection {
         T: MakeTlsConnect<Socket> + Clone + Send + 'static,
         <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
     {
-        let backoff = SharedExponentialBackoff::new(ExponentialBackoff::with_backoff(
+        let backoff = ExponentialBackoff::with_backoff(
             Duration::from_millis(100),
             Duration::from_secs(30),
             1.8,
-        ));
+        );
 
         let (client, connection) = match options.connection_params {
             ConnectionParameters::ConnectionStr(s) => connect(&s, options.tls).await?,

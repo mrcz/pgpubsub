@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc::UnboundedReceiver, oneshot};
 use tokio_postgres::{tls::MakeTlsConnect, AsyncMessage, Connection, Socket};
 
 use crate::{
-    exponential_backoff::SharedExponentialBackoff,
+    exponential_backoff::ExponentialBackoff,
     pg_client::PgClient,
     pg_pubsub_connection::{Listener, Notification},
 };
@@ -55,7 +55,7 @@ pub(crate) fn create_listener_task<T>(
     mut connection: Connection<Socket, <T as MakeTlsConnect<Socket>>::Stream>,
     listener_map: Arc<DashMap<Box<str>, Listener>>,
     suppress_own_notifications: bool,
-    backoff: SharedExponentialBackoff,
+    mut backoff: ExponentialBackoff,
     disconnected_sx: broadcast::Sender<()>,
     mut disconnected_rx: broadcast::Receiver<()>,
 ) -> (
@@ -110,7 +110,7 @@ where
             match item {
                 Ok(AsyncMessage::Notification(msg)) => {
                     log::debug!("Notification: {msg:?}");
-                    backoff.reset().await;
+                    backoff.reset();
                     if suppress_own_notifications && backend_pid == Some(msg.process_id()) {
                         continue;
                     }
