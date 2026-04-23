@@ -90,18 +90,6 @@ where
                 }
             };
 
-            // Obtain the backend PID on the first iteration (sent after this task starts).
-            // If the sender is dropped before sending (e.g. due to a racing shutdown),
-            // proceed without suppression rather than panicking.
-            if let Some(rx) = backend_pid_rx.take() {
-                match rx.await {
-                    Ok(pid) => backend_pid = Some(pid),
-                    Err(_) => log::warn!(
-                        "Backend PID sender dropped; own-notification suppression disabled"
-                    ),
-                }
-            }
-
             if !disconnected_rx.is_empty() {
                 log::debug!("Listener thread received disconnect signal");
                 return Ok(());
@@ -111,6 +99,17 @@ where
                 Ok(AsyncMessage::Notification(msg)) => {
                     log::debug!("Notification: {msg:?}");
                     backoff.reset();
+                    // Take the backend PID the first time we actually need it for suppression.
+                    // The sender drops without sending if connect() shuts down racily; fall back
+                    // to "don't suppress" in that case rather than panicking.
+                    if let Some(rx) = backend_pid_rx.take() {
+                        match rx.await {
+                            Ok(pid) => backend_pid = Some(pid),
+                            Err(_) => log::warn!(
+                                "Backend PID sender dropped; own-notification suppression disabled"
+                            ),
+                        }
+                    }
                     if suppress_own_notifications && backend_pid == Some(msg.process_id()) {
                         continue;
                     }
