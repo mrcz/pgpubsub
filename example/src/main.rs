@@ -1,4 +1,4 @@
-use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder};
+use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder, RecvError};
 
 #[tokio::main]
 async fn main() {
@@ -29,14 +29,26 @@ async fn notification_listener_loop(pub_sub: &PgPubSub, channel: &str) {
     match pub_sub.listen(channel).await {
         Ok(mut receiver) => {
             log::info!(r#"Listened to channel "{channel}""#);
-            while let Ok(msg) = receiver.recv().await {
-                log::info!("{msg:?}");
-                // Send a notification that requires escaping the payload.
-                if let Err(err) = pub_sub
-                    .notify("channel2", Some("Ain't talkin' bout dub"))
-                    .await
-                {
-                    log::error!("Error when notifying: {err:?}");
+            loop {
+                match receiver.recv().await {
+                    Ok(msg) => {
+                        log::info!("{msg:?}");
+                        // Send a notification that requires escaping the payload.
+                        if let Err(err) = pub_sub
+                            .notify("channel2", Some("Ain't talkin' bout dub"))
+                            .await
+                        {
+                            log::error!("Error when notifying: {err:?}");
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        log::warn!("Subscription lagged, {n} notifications dropped");
+                    }
+                    Err(RecvError::Closed) => break,
+                    Err(err) => {
+                        log::error!("Receive error: {err}");
+                        break;
+                    }
                 }
             }
         }

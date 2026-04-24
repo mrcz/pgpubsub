@@ -16,7 +16,7 @@ Async PostgreSQL LISTEN/NOTIFY pub/sub client built on
 ## Usage
 
 ```rust
-use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder};
+use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder, RecvError};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,8 +28,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pubsub = PgPubSub::connect(options).await?;
     let mut subscription = pubsub.listen("my_channel").await?;
 
-    while let Ok(notification) = subscription.recv().await {
-        println!("{}: {}", notification.channel, notification.payload);
+    loop {
+        match subscription.recv().await {
+            Ok(notification) => {
+                println!("{}: {}", notification.channel, notification.payload);
+            }
+            Err(RecvError::Lagged(n)) => {
+                eprintln!("lagged, {n} notifications dropped");
+            }
+            Err(RecvError::Closed) => break,
+            Err(err) => {
+                eprintln!("receive error: {err}");
+                break;
+            }
+        }
     }
 
     Ok(())

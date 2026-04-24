@@ -51,10 +51,42 @@ pub struct Subscription {
 
 impl Subscription {
     /// Waits for the next notification on this channel.
-    pub async fn recv(&mut self) -> Result<Notification, broadcast::error::RecvError> {
-        self.receiver.recv().await
+    ///
+    /// Returns [`RecvError::Closed`] when the underlying [`PgPubSub`](crate::PgPubSub) has been
+    /// dropped. Returns [`RecvError::Lagged`] when the subscription fell behind the broadcast
+    /// channel's capacity and notifications were dropped; the subscription is still usable and
+    /// subsequent calls to `recv` resume from the oldest retained notification.
+    pub async fn recv(&mut self) -> Result<Notification, RecvError> {
+        self.receiver.recv().await.map_err(|err| match err {
+            broadcast::error::RecvError::Closed => RecvError::Closed,
+            broadcast::error::RecvError::Lagged(n) => RecvError::Lagged(n),
+        })
     }
 }
+
+/// Error returned by [`Subscription::recv`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RecvError {
+    /// The [`PgPubSub`](crate::PgPubSub) was dropped; no more notifications will arrive on this
+    /// subscription.
+    Closed,
+    /// The subscription fell behind the broadcast channel's capacity and the contained number of
+    /// notifications were dropped. The subscription itself is still valid — call
+    /// [`Subscription::recv`] again to resume receiving.
+    Lagged(u64),
+}
+
+impl std::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecvError::Closed => write!(f, "subscription closed"),
+            RecvError::Lagged(n) => write!(f, "subscription lagged, {n} notifications dropped"),
+        }
+    }
+}
+
+impl std::error::Error for RecvError {}
 
 impl Drop for Subscription {
     fn drop(&mut self) {

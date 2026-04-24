@@ -4,7 +4,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder};
+//! use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder, RecvError};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,9 +15,13 @@
 //! let pubsub = PgPubSub::connect(options).await?;
 //! let mut subscription = pubsub.listen("my_channel").await?;
 //!
-//! // Receive notifications
-//! while let Ok(notification) = subscription.recv().await {
-//!     println!("{}: {}", notification.channel, notification.payload);
+//! loop {
+//!     match subscription.recv().await {
+//!         Ok(n) => println!("{}: {}", n.channel, n.payload),
+//!         Err(RecvError::Lagged(n)) => eprintln!("lagged, {n} dropped"),
+//!         Err(RecvError::Closed) => break,
+//!         Err(err) => { eprintln!("{err}"); break; }
+//!     }
 //! }
 //! Ok(())
 //! }
@@ -26,7 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub use pg_pubsub::PgPubSub;
-pub use pg_pubsub_connection::{Notification, PubSubError, Subscription};
+pub use pg_pubsub_connection::{Notification, PubSubError, RecvError, Subscription};
 pub use pg_pubsub_options::PgPubSubOptions;
 pub use pg_pubsub_options::PgPubSubOptionsBuilder;
 
