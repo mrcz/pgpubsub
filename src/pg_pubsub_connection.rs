@@ -1,14 +1,14 @@
 use crate::exponential_backoff::ExponentialBackoff;
 use crate::pg_connection_listener::{create_listener_task, unsubscription_task};
 use crate::tokio_postgres::{MakeTlsConnect, Socket};
-use async_task_group::{GroupJoinHandle, TaskGroup};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinSet;
 
-use tokio_postgres::{connect, Error};
+use tokio_postgres::connect;
 
 use crate::pg_client::PgClient;
 use crate::pg_pubsub_options::{ConnectionParameters, PgPubSubOptions};
@@ -18,8 +18,8 @@ pub struct PgPubSubConnection {
     listeners: Arc<DashMap<Box<str>, Listener>>,
     channel_capacity: usize,
     unsub_tx: mpsc::UnboundedSender<Box<str>>,
-    #[allow(unused)] // held to keep the background tasks alive
-    group_handle: GroupJoinHandle<Error>,
+    #[allow(unused)] // JoinSet aborts its tasks on drop, keeping them tied to this handle.
+    tasks: JoinSet<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +35,30 @@ pub struct Notification {
 pub(crate) struct Listener {
     pub send_channel: broadcast::Sender<Notification>,
     pub listener_count: AtomicUsize,
+}
+
+/// RAII guard that rolls back a `listen()` refcount increment if the function does not
+/// complete successfully (including when the future is dropped mid-await). Disarmed with
+/// `disarm()` once the `Subscription` is about to be returned.
+struct ListenRollbackGuard<'a> {
+    key: Option<Box<str>>,
+    unsub_tx: &'a mpsc::UnboundedSender<Box<str>>,
+}
+
+impl ListenRollbackGuard<'_> {
+    fn disarm(mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for ListenRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            if let Err(err) = self.unsub_tx.send(key) {
+                log::error!("Failed to roll back listener: {err}");
+            }
+        }
+    }
 }
 
 /// A subscription to a PostgreSQL notification channel.
@@ -152,81 +176,49 @@ impl PgPubSubConnection {
             ConnectionParameters::TokioPostgresConfig(cfg) => cfg.connect(options.tls).await?,
         };
 
-        // Create the PgClient object and share between sender and receiver.
         let pg_client = Arc::new(PgClient::new(client));
-        let pg_client2 = Arc::clone(&pg_client);
-        let pg_client3 = Arc::clone(&pg_client);
-        let listener_map2 = Arc::clone(&listener_map);
-        let listener_map3 = Arc::clone(&listener_map);
-
         let (unsub_tx, unsub_rx) = mpsc::unbounded_channel();
 
         let (listener_future, backend_pid_sx) = create_listener_task::<T>(
             connection,
-            listener_map2,
+            Arc::clone(&listener_map),
             options.suppress_own_notifications,
             backoff,
             disconnected_sx,
             disconnected_rx,
         );
 
-        // The group closure runs asynchronously, so errors inside it don't naturally propagate
-        // out of connect(). We use a oneshot to surface the bootstrap result back here, so a
-        // failed get_pid() fails connect() instead of silently handing out a broken PgPubSub.
-        let (bootstrap_tx, bootstrap_rx) = oneshot::channel::<Result<(), Error>>();
+        // JoinSet aborts its tasks on drop, so any early return from this function
+        // (e.g. get_pid failure) cleans up the spawned listener.
+        let mut tasks: JoinSet<()> = JoinSet::new();
 
-        let group_handle = async_task_group::group(|group: TaskGroup<Error>| async move {
-            // Spawn the connection polling loop first so the connection is driven.
-            group.spawn(listener_future);
-            // Now that the connection is being polled, we can query for the backend PID.
-            if let Some(pid_sx) = backend_pid_sx {
-                match pg_client2.get_pid().await {
-                    Ok(pid) => {
-                        if pid_sx.send(pid).is_err() {
-                            log::warn!("Listener exited before backend PID was sent");
-                        }
-                    }
-                    Err(err) => {
-                        // Report the failure back to connect() and stop bootstrapping; dropping
-                        // group_handle on the caller side will cancel the listener.
-                        let _ = bootstrap_tx.send(Err(err));
-                        return Ok(group);
-                    }
-                }
+        // Spawn the connection polling loop first so subsequent queries are driven.
+        tasks.spawn(async move {
+            if let Err(err) = listener_future.await {
+                log::error!("Listener task exited with error: {err}");
             }
-            let _ = bootstrap_tx.send(Ok(()));
-            group.spawn(async {
-                unsubscription_task(unsub_rx, listener_map3, pg_client3).await;
-                Ok(())
-            });
-            Ok(group)
         });
 
-        // Wait for bootstrap to complete before returning a handle to the user. If it failed,
-        // drop group_handle so the spawned listener task is cancelled.
-        match bootstrap_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                drop(group_handle);
-                return Err(err);
-            }
-            Err(_) => {
-                // Sender dropped without sending (group closure panicked or was cancelled).
-                // There's no good error to synthesize here, so log and fall through — the group
-                // is already dead, so the user will see failures on the first listen/notify.
-                log::error!("PgPubSub bootstrap did not complete");
+        if let Some(pid_sx) = backend_pid_sx {
+            let pid = pg_client.get_pid().await?;
+            if pid_sx.send(pid).is_err() {
+                log::warn!("Listener exited before backend PID was sent");
             }
         }
 
-        let service = PgPubSubConnection {
+        let unsub_pg_client = Arc::clone(&pg_client);
+        let unsub_listener_map = Arc::clone(&listener_map);
+        tasks.spawn(async move {
+            unsubscription_task(unsub_rx, unsub_listener_map, unsub_pg_client).await;
+        });
+
+        Ok(PgPubSubConnection {
             pg_client,
             listeners: listener_map,
             channel_capacity: options.channel_capacity,
             unsub_tx,
-            group_handle,
-        };
-
-        Ok(service)
+            tasks,
+        })
     }
 
     pub async fn listen(&self, channel: &str) -> Result<Subscription, PubSubError> {
@@ -253,17 +245,21 @@ impl PgPubSubConnection {
             (receiver, prev == 0)
         };
 
+        // If we exit this function without returning a Subscription — whether through
+        // listen_cmd() failing or the caller cancelling this future mid-await — the rollback
+        // guard routes the key through the unsubscription task so the refcount we just
+        // incremented is decremented (and the entry removed with a best-effort UNLISTEN if
+        // the count drops to zero).
+        let rollback = ListenRollbackGuard {
+            key: Some(key),
+            unsub_tx: &self.unsub_tx,
+        };
+
         if is_new {
-            if let Err(err) = self.listen_cmd(channel).await {
-                // Roll back by routing through the unsubscription task: it will decrement the
-                // refcount and, if it reaches zero, remove the entry and best-effort UNLISTEN
-                // in case LISTEN partially succeeded.
-                if let Err(send_err) = self.unsub_tx.send(key) {
-                    log::error!("Failed to roll back listener after LISTEN error: {send_err}");
-                }
-                return Err(err);
-            }
+            self.listen_cmd(channel).await?;
         }
+
+        rollback.disarm();
 
         Ok(Subscription {
             channel: channel.into(),

@@ -10,7 +10,6 @@ categories = ["database", "asynchronous"]
 exclude = [".vscode/"]
 
 [dependencies]
-async-task-group = "0.2.1"
 dashmap = "6.1.0"
 either = "1.15.0"
 futures-concurrency = "7.7.1"

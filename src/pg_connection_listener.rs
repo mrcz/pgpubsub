@@ -27,8 +27,17 @@ where
 }
 
 async fn poll_disconnect(disconnected_rx: &mut broadcast::Receiver<()>) -> PollResult {
-    if let Err(e) = disconnected_rx.recv().await {
-        log::error!("Disconnect channel closed, disconnecting: {e}");
+    match disconnected_rx.recv().await {
+        Ok(()) => {}
+        Err(broadcast::error::RecvError::Closed) => {
+            // All senders dropped; shouldn't happen since the listener task owns a sender,
+            // but treat it as a disconnect if it does.
+            log::debug!("Disconnect channel closed");
+        }
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            // Capacity-1 channel — can happen if multiple disconnects fire. Still a disconnect.
+            log::debug!("Disconnect channel lagged by {n}");
+        }
     }
     Either::Right(())
 }
