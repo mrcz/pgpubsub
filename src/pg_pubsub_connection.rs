@@ -1,11 +1,11 @@
 use crate::exponential_backoff::ExponentialBackoff;
-use crate::pg_connection_listener::{create_listener_task, unsubscription_task};
+use crate::pg_connection_listener::{command_task, create_listener_task};
 use crate::tokio_postgres::{MakeTlsConnect, Socket};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use tokio_postgres::connect;
@@ -17,9 +17,22 @@ pub struct PgPubSubConnection {
     pg_client: Arc<PgClient>,
     listeners: Arc<DashMap<Box<str>, Listener>>,
     channel_capacity: usize,
-    unsub_tx: mpsc::UnboundedSender<Box<str>>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
     #[allow(unused)] // JoinSet aborts its tasks on drop, keeping them tied to this handle.
     tasks: JoinSet<()>,
+}
+
+/// Work item processed by `command_task`. Issuing LISTEN/UNLISTEN through a single
+/// serialised queue is what eliminates the LISTEN-vs-UNLISTEN ordering race; see the
+/// docstring on `command_task` for details.
+pub(crate) enum Command {
+    Listen {
+        channel: Box<str>,
+        response: oneshot::Sender<Result<(), tokio_postgres::Error>>,
+    },
+    Unsub {
+        channel: Box<str>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +55,7 @@ pub(crate) struct Listener {
 /// `disarm()` once the `Subscription` is about to be returned.
 struct ListenRollbackGuard<'a> {
     key: Option<Box<str>>,
-    unsub_tx: &'a mpsc::UnboundedSender<Box<str>>,
+    cmd_tx: &'a mpsc::UnboundedSender<Command>,
 }
 
 impl ListenRollbackGuard<'_> {
@@ -54,7 +67,7 @@ impl ListenRollbackGuard<'_> {
 impl Drop for ListenRollbackGuard<'_> {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
-            if let Err(err) = self.unsub_tx.send(key) {
+            if let Err(err) = self.cmd_tx.send(Command::Unsub { channel: key }) {
                 log::error!("Failed to roll back listener: {err}");
             }
         }
@@ -70,7 +83,7 @@ impl Drop for ListenRollbackGuard<'_> {
 pub struct Subscription {
     channel: Box<str>,
     receiver: broadcast::Receiver<Notification>,
-    unsub_tx: mpsc::UnboundedSender<Box<str>>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
 impl Subscription {
@@ -116,7 +129,7 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         log::debug!("Unsubscribing from channel {channel}", channel = self.channel);
         let channel = std::mem::take(&mut self.channel);
-        if let Err(err) = self.unsub_tx.send(channel) {
+        if let Err(err) = self.cmd_tx.send(Command::Unsub { channel }) {
             log::error!("Error when unsubscribing: {err}");
         }
     }
@@ -132,6 +145,9 @@ pub enum PubSubError {
     SendError(tokio_postgres::Error),
     /// Failed to send a NOTIFY command.
     NotifyError(tokio_postgres::Error),
+    /// The underlying [`PgPubSub`](crate::PgPubSub) was dropped before the operation could
+    /// complete, so its background command task is no longer running.
+    Closed,
 }
 
 impl std::fmt::Display for PubSubError {
@@ -140,6 +156,7 @@ impl std::fmt::Display for PubSubError {
             PubSubError::InvalidChannelName => write!(f, "invalid channel name"),
             PubSubError::SendError(e) => write!(f, "failed to send LISTEN command: {e}"),
             PubSubError::NotifyError(e) => write!(f, "failed to send NOTIFY command: {e}"),
+            PubSubError::Closed => write!(f, "PgPubSub connection closed"),
         }
     }
 }
@@ -148,7 +165,7 @@ impl std::error::Error for PubSubError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PubSubError::SendError(e) | PubSubError::NotifyError(e) => Some(e),
-            PubSubError::InvalidChannelName => None,
+            PubSubError::InvalidChannelName | PubSubError::Closed => None,
         }
     }
 }
@@ -178,7 +195,7 @@ impl PgPubSubConnection {
         let (disconnected_sx, disconnected_rx) = broadcast::channel(1);
 
         let pg_client = Arc::new(PgClient::new(client));
-        let (unsub_tx, unsub_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let (listener_future, backend_pid_sx) = create_listener_task::<T>(
             connection,
@@ -207,17 +224,17 @@ impl PgPubSubConnection {
             }
         }
 
-        let unsub_pg_client = Arc::clone(&pg_client);
-        let unsub_listener_map = Arc::clone(&listener_map);
+        let cmd_pg_client = Arc::clone(&pg_client);
+        let cmd_listener_map = Arc::clone(&listener_map);
         tasks.spawn(async move {
-            unsubscription_task(unsub_rx, unsub_listener_map, unsub_pg_client).await;
+            command_task(cmd_rx, cmd_listener_map, cmd_pg_client).await;
         });
 
         Ok(PgPubSubConnection {
             pg_client,
             listeners: listener_map,
             channel_capacity: options.channel_capacity,
-            unsub_tx,
+            cmd_tx,
             tasks,
         })
     }
@@ -229,11 +246,13 @@ impl PgPubSubConnection {
 
         let key: Box<str> = channel.into();
 
-        // Insert-or-update the listener entry and subscribe before issuing LISTEN, so a
-        // notification that arrives between the LISTEN response and this function returning is
-        // delivered to at least one receiver. The shard guard is released before the await
-        // below so concurrent operations on the same shard are not blocked on the round-trip.
-        let (receiver, is_new) = {
+        // Insert-or-update the listener entry, subscribe to its broadcast channel, and (if
+        // we're the first listener) enqueue the LISTEN command — all under the shard lock
+        // so that the order of `Command::Listen`/`Command::Unsub` enqueues for this channel
+        // matches the order in which their lock-protected sections ran. The funnel
+        // (`command_task`) processes commands strictly in that order, which is what makes
+        // the LISTEN-vs-UNLISTEN ordering race impossible.
+        let (receiver, listen_response_rx) = {
             let entry = self.listeners.entry(key.clone()).or_insert_with(|| {
                 let (sender, _) = broadcast::channel(self.channel_capacity);
                 Listener {
@@ -242,27 +261,49 @@ impl PgPubSubConnection {
                 }
             });
             // Relaxed is sufficient because every access to listener_count (this fetch_add
-            // here, the fetch_sub in unsubscription_task, and the load inside its remove_if
-            // predicate) happens while holding the DashMap shard lock. The lock's
-            // release/acquire chain provides the happens-before relationship; if this access
-            // is ever moved outside the shard lock, the ordering must be revisited.
+            // here and the fetch_sub in command_task) happens while holding the DashMap
+            // shard lock. The lock's release/acquire chain provides the happens-before
+            // relationship; if this access is ever moved outside the shard lock, the
+            // ordering must be revisited.
             let prev = entry.listener_count.fetch_add(1, Ordering::Relaxed);
             let receiver = entry.send_channel.subscribe();
-            (receiver, prev == 0)
+            let listen_rx = if prev == 0 {
+                let (response_tx, response_rx) = oneshot::channel();
+                if self
+                    .cmd_tx
+                    .send(Command::Listen {
+                        channel: key.clone(),
+                        response: response_tx,
+                    })
+                    .is_err()
+                {
+                    // Funnel is gone; no point keeping the entry. Drop it directly under
+                    // the shard guard rather than going through Unsub (which would also
+                    // fail).
+                    entry.listener_count.fetch_sub(1, Ordering::Relaxed);
+                    return Err(PubSubError::Closed);
+                }
+                Some(response_rx)
+            } else {
+                None
+            };
+            (receiver, listen_rx)
         };
 
-        // If we exit this function without returning a Subscription — whether through
-        // listen_cmd() failing or the caller cancelling this future mid-await — the rollback
-        // guard routes the key through the unsubscription task so the refcount we just
-        // incremented is decremented (and the entry removed with a best-effort UNLISTEN if
-        // the count drops to zero).
+        // If we exit this function without returning a Subscription — whether through the
+        // LISTEN failing or the caller cancelling this future mid-await — the rollback
+        // guard routes an Unsub through the funnel so the refcount we just incremented is
+        // decremented (and the entry removed with a best-effort UNLISTEN if the count
+        // drops to zero).
         let rollback = ListenRollbackGuard {
             key: Some(key),
-            unsub_tx: &self.unsub_tx,
+            cmd_tx: &self.cmd_tx,
         };
 
-        if is_new {
-            self.listen_cmd(channel).await?;
+        if let Some(rx) = listen_response_rx {
+            rx.await
+                .map_err(|_| PubSubError::Closed)?
+                .map_err(PubSubError::SendError)?;
         }
 
         rollback.disarm();
@@ -270,20 +311,12 @@ impl PgPubSubConnection {
         Ok(Subscription {
             channel: channel.into(),
             receiver,
-            unsub_tx: self.unsub_tx.clone(),
+            cmd_tx: self.cmd_tx.clone(),
         })
     }
 
     pub async fn notify(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {
         self.notify_cmd(channel, payload).await
-    }
-
-    async fn listen_cmd(&self, channel: &str) -> Result<(), PubSubError> {
-        log::debug!("Listening to channel {channel}");
-        self.pg_client
-            .listen(channel)
-            .await
-            .map_err(PubSubError::SendError)
     }
 
     async fn notify_cmd(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {

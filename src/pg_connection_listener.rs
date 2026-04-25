@@ -1,6 +1,6 @@
 use std::{future::poll_fn, sync::atomic::Ordering, sync::Arc};
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use either::Either;
 use futures_concurrency::future::Race;
 use futures_util::Future;
@@ -10,8 +10,13 @@ use tokio_postgres::{tls::MakeTlsConnect, AsyncMessage, Connection, Socket};
 use crate::{
     exponential_backoff::ExponentialBackoff,
     pg_client::PgClient,
-    pg_pubsub_connection::{Listener, Notification},
+    pg_pubsub_connection::{Command, Listener, Notification},
 };
+
+/// Maximum number of UNLISTEN attempts in `command_task` before giving up. With the default
+/// exponential backoff (100ms start, 5s max, 1.8 factor) this is on the order of ~10s of
+/// retrying for a single channel.
+const MAX_UNLISTEN_RETRIES: usize = 5;
 
 type PollResult = Either<Option<Result<AsyncMessage, tokio_postgres::Error>>, ()>;
 
@@ -157,33 +162,80 @@ where
     (handle, backend_pid_sx)
 }
 
-pub(crate) async fn unsubscription_task(
-    mut unsub_rx: UnboundedReceiver<Box<str>>,
-    unsub_listener_map: Arc<DashMap<Box<str>, Listener>>,
+/// Single task that funnels every LISTEN and UNLISTEN command through one queue, owning
+/// `pg_client` exclusively for those operations. Serial processing means LISTEN and
+/// UNLISTEN reach the connection in the order their `Command`s were enqueued — `listen()`
+/// enqueues its `Listen` while still holding the DashMap shard lock, and `Subscription`
+/// drop / rollback enqueue `Unsub` likewise (the shard lock is taken inside this task for
+/// the refcount work). Combined, that fixes the historical race where a concurrent
+/// `listen()` could slip its LISTEN in front of an in-flight UNLISTEN, and makes UNLISTEN
+/// retries safe (any later LISTEN simply waits behind us in the queue).
+///
+/// `notify()` and `get_pid()` continue to call `pg_client` directly — they don't compete
+/// for ordering and would only pay extra latency for going through the funnel.
+pub(crate) async fn command_task(
+    mut cmd_rx: UnboundedReceiver<Command>,
+    listener_map: Arc<DashMap<Box<str>, Listener>>,
     pg_client: Arc<PgClient>,
 ) {
-    while let Some(channel) = unsub_rx.recv().await {
-        if let Some(listener) = unsub_listener_map.get(&channel) {
-            let prev = listener.listener_count.fetch_sub(1, Ordering::AcqRel);
-            assert!(prev > 0);
-            if prev == 1 {
-                // Last listener removed. Drop the read ref before trying to remove.
-                drop(listener);
-                // Remove the entry only if the count is still 0. This guards against
-                // a concurrent listen() that re-subscribed between our fetch_sub and
-                // this remove. DashMap holds its shard lock during remove_if, so
-                // listen()'s entry() call cannot interleave with this check.
-                let removed = unsub_listener_map.remove_if(&channel, |_key, listener| {
-                    listener.listener_count.load(Ordering::Acquire) == 0
-                });
-                if removed.is_some() {
-                    // Entry was removed, so no active listeners. Send UNLISTEN.
-                    log::debug!("Unlistening from {channel}");
-                    if let Err(err) = pg_client.unlisten(&channel).await {
-                        log::error!("Error when unlistening: {err:?}");
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Command::Listen { channel, response } => {
+                log::debug!("Listening to channel {channel}");
+                let result = pg_client.listen(&channel).await;
+                if response.send(result).is_err() {
+                    log::debug!("Listen response dropped (caller cancelled)");
+                }
+            }
+            Command::Unsub { channel } => {
+                let should_unlisten = match listener_map.entry(channel.clone()) {
+                    Entry::Occupied(occ) => {
+                        let prev = occ.get().listener_count.fetch_sub(1, Ordering::AcqRel);
+                        assert!(prev > 0);
+                        if prev == 1 {
+                            occ.remove();
+                            true
+                        } else {
+                            false
+                        }
                     }
+                    Entry::Vacant(_) => {
+                        log::warn!("Unsub for non-existent channel {channel}");
+                        false
+                    }
+                };
+
+                if should_unlisten {
+                    unlisten_with_retry(&channel, &pg_client, &listener_map).await;
                 }
             }
         }
     }
+}
+
+/// Attempts UNLISTEN with bounded exponential backoff. Aborts early if a concurrent
+/// `listen()` reclaims the entry — in that case the queued LISTEN behind us will run as
+/// soon as we return, leaving the server in the right state regardless of whether the
+/// final UNLISTEN attempt landed before we saw the new entry.
+async fn unlisten_with_retry(
+    channel: &str,
+    pg_client: &PgClient,
+    listener_map: &DashMap<Box<str>, Listener>,
+) {
+    let mut backoff = ExponentialBackoff::default();
+    for attempt in 1..=MAX_UNLISTEN_RETRIES {
+        log::debug!("Unlistening from {channel} (attempt {attempt}/{MAX_UNLISTEN_RETRIES})");
+        match pg_client.unlisten(channel).await {
+            Ok(()) => return,
+            Err(err) => {
+                log::warn!("UNLISTEN {channel} attempt {attempt} failed: {err}");
+            }
+        }
+        if listener_map.contains_key(channel) {
+            log::debug!("Aborting UNLISTEN retry for {channel}: re-subscribed");
+            return;
+        }
+        backoff.fail_and_sleep().await;
+    }
+    log::error!("Giving up on UNLISTEN for {channel} after {MAX_UNLISTEN_RETRIES} attempts");
 }
