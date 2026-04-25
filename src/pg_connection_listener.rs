@@ -130,38 +130,14 @@ where
                     if suppress_own_notifications && backend_pid == Some(msg.process_id()) {
                         continue;
                     }
-                    if let Some(sender) = listener_map.get(msg.channel()) {
-                        let notification = Notification {
-                            channel: msg.channel().into(),
-                            payload: msg.payload().into(),
-                            process_id: msg.process_id(),
-                        };
-                        if let Err(err) = sender.send_channel.send(notification) {
-                            log::error!(
-                                "Error when sending on channel {channel}: {err}",
-                                channel = msg.channel(),
-                            )
-                        }
-                    } else {
-                        // Notification for a channel we don't track. Most often this is the
-                        // tail of a teardown (the server hasn't fully processed our UNLISTEN
-                        // yet); occasionally it means an UNLISTEN failed and we still have
-                        // server-side LISTEN state. Either way, ask the funnel to UNLISTEN
-                        // if the entry is still empty when it gets there. The dedupe set
-                        // coalesces bursts so we don't enqueue one per stray notification.
-                        let channel: Box<str> = msg.channel().into();
-                        if pending_unlisten.insert(channel.clone())
-                            && cmd_tx
-                                .send(Command::UnlistenIfEmpty {
-                                    channel: channel.clone(),
-                                })
-                                .is_err()
-                        {
-                            // Funnel is gone; whole connection is shutting down. Roll the
-                            // dedupe set back so we don't leak a placeholder entry.
-                            pending_unlisten.remove(&channel);
-                        }
-                    }
+                    dispatch_notification(
+                        msg.channel(),
+                        msg.payload(),
+                        msg.process_id(),
+                        &listener_map,
+                        &pending_unlisten,
+                        &cmd_tx,
+                    );
                 }
                 Ok(AsyncMessage::Notice(db_error)) => {
                     log::error!("PgListener got Notice: {db_error}");
@@ -181,6 +157,48 @@ where
     };
 
     (handle, backend_pid_sx)
+}
+
+/// Routes a single notification to its broadcast channel if there's a listener entry, or
+/// asks the funnel to clean up server-side LISTEN state via `Command::UnlistenIfEmpty` if
+/// there isn't. Pulled out of the listener task so it can be unit-tested without standing
+/// up a real Postgres connection.
+///
+/// The unknown-channel branch is the recovery path for an UNLISTEN that failed earlier in
+/// `Command::Unsub`: a stray notification arriving for a channel we don't track is the
+/// trigger that asks the funnel to retry. The dedupe set coalesces bursts so we send at
+/// most one `UnlistenIfEmpty` per round-trip per channel.
+pub(crate) fn dispatch_notification(
+    channel: &str,
+    payload: &str,
+    process_id: i32,
+    listener_map: &DashMap<Box<str>, Listener>,
+    pending_unlisten: &DashSet<Box<str>>,
+    cmd_tx: &UnboundedSender<Command>,
+) {
+    if let Some(sender) = listener_map.get(channel) {
+        let notification = Notification {
+            channel: channel.into(),
+            payload: payload.into(),
+            process_id,
+        };
+        if let Err(err) = sender.send_channel.send(notification) {
+            log::error!("Error when sending on channel {channel}: {err}");
+        }
+    } else {
+        let key: Box<str> = channel.into();
+        if pending_unlisten.insert(key.clone())
+            && cmd_tx
+                .send(Command::UnlistenIfEmpty {
+                    channel: key.clone(),
+                })
+                .is_err()
+        {
+            // Funnel is gone; whole connection is shutting down. Roll the dedupe set back
+            // so we don't leak a placeholder entry.
+            pending_unlisten.remove(&key);
+        }
+    }
 }
 
 /// Single task that funnels every LISTEN and UNLISTEN command through one queue, owning
@@ -258,5 +276,161 @@ pub(crate) async fn command_task(
                 pending_unlisten.remove(&channel);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    struct Fixture {
+        listener_map: Arc<DashMap<Box<str>, Listener>>,
+        pending_unlisten: Arc<DashSet<Box<str>>>,
+        cmd_tx: UnboundedSender<Command>,
+        cmd_rx: mpsc::UnboundedReceiver<Command>,
+    }
+
+    fn fixture() -> Fixture {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        Fixture {
+            listener_map: Default::default(),
+            pending_unlisten: Default::default(),
+            cmd_tx,
+            cmd_rx,
+        }
+    }
+
+    /// Inserts a fresh entry with the given count and returns a `Receiver` so the test can
+    /// observe what (if anything) `dispatch_notification` broadcast.
+    fn insert_listener(
+        listener_map: &DashMap<Box<str>, Listener>,
+        channel: &str,
+        count: usize,
+    ) -> broadcast::Receiver<Notification> {
+        let (sender, receiver) = broadcast::channel(8);
+        listener_map.insert(
+            channel.into(),
+            Listener {
+                send_channel: sender,
+                listener_count: AtomicUsize::new(count),
+            },
+        );
+        receiver
+    }
+
+    #[test]
+    fn unknown_channel_enqueues_unlisten_if_empty() {
+        let mut f = fixture();
+
+        dispatch_notification("foo", "data", 42, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+
+        match f.cmd_rx.try_recv().expect("expected one command queued") {
+            Command::UnlistenIfEmpty { channel } => assert_eq!(&*channel, "foo"),
+            other => panic!("unexpected command queued: {:?}", std::mem::discriminant(&other)),
+        }
+        assert!(f.pending_unlisten.contains("foo"));
+        assert!(f.cmd_rx.try_recv().is_err(), "no further commands expected");
+    }
+
+    #[test]
+    fn unknown_channel_bursts_are_coalesced() {
+        let mut f = fixture();
+
+        for _ in 0..5 {
+            dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        }
+
+        // Exactly one UnlistenIfEmpty even though five stray notifications arrived: the
+        // dedupe set blocks subsequent enqueues until the funnel processes the first one.
+        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+        assert!(f.cmd_rx.try_recv().is_err());
+        assert!(f.pending_unlisten.contains("foo"));
+    }
+
+    #[test]
+    fn unknown_channel_re_enqueues_after_dedupe_clear() {
+        let mut f = fixture();
+
+        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+
+        // Funnel processed the first UnlistenIfEmpty and cleared the dedupe slot. A new
+        // stray notification should be able to enqueue again.
+        f.pending_unlisten.remove("foo");
+
+        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+    }
+
+    #[test]
+    fn known_channel_broadcasts_and_does_not_enqueue() {
+        let mut f = fixture();
+        let mut receiver = insert_listener(&f.listener_map, "foo", 1);
+
+        dispatch_notification("foo", "hello", 7, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+
+        let n = receiver.try_recv().expect("notification was not broadcast");
+        assert_eq!(&*n.channel, "foo");
+        assert_eq!(&*n.payload, "hello");
+        assert_eq!(n.process_id, 7);
+
+        assert!(f.cmd_rx.try_recv().is_err(), "no command should be queued");
+        assert!(
+            !f.pending_unlisten.contains("foo"),
+            "known-channel path must not touch the dedupe set"
+        );
+    }
+
+    #[test]
+    fn subscribe_just_before_notification_takes_broadcast_path() {
+        // Models: listen() ran (entry inserted) and then a notification arrives. Should
+        // go straight to the broadcast channel — no UnlistenIfEmpty involvement.
+        let mut f = fixture();
+        let mut receiver = insert_listener(&f.listener_map, "foo", 1);
+
+        dispatch_notification("foo", "hi", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(f.cmd_rx.try_recv().is_err());
+        assert!(!f.pending_unlisten.contains("foo"));
+    }
+
+    #[test]
+    fn subscribe_just_after_notification_keeps_unlisten_command_in_queue() {
+        // Models: notification arrives for an unknown channel (UnlistenIfEmpty queued),
+        // then a listen() inserts the entry before the funnel processes the command.
+        // The command stays queued; the funnel will short-circuit it on processing
+        // because contains_key now returns true. Test the queue + map state that the
+        // funnel will see.
+        let mut f = fixture();
+
+        dispatch_notification("foo", "hi", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+        assert!(f.pending_unlisten.contains("foo"));
+
+        // listen() inserts the entry concurrently.
+        let _receiver = insert_listener(&f.listener_map, "foo", 1);
+
+        // The dedupe entry stays until the funnel clears it. The funnel's UnlistenIfEmpty
+        // handler would now see contains_key=true and skip the UNLISTEN — verify that
+        // condition holds (we can't run command_task here without a real PgClient).
+        assert!(f.listener_map.contains_key("foo"));
+    }
+
+    #[test]
+    fn dispatch_does_not_enqueue_when_funnel_is_gone() {
+        let f = fixture();
+        // Drop the receiver to simulate the funnel having exited.
+        drop(f.cmd_rx);
+
+        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+
+        // The dedupe slot must be rolled back so the placeholder doesn't outlive the
+        // failed enqueue. (The funnel never receives anything anyway.)
+        assert!(!f.pending_unlisten.contains("foo"));
     }
 }
