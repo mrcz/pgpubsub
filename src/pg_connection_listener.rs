@@ -1,9 +1,14 @@
-use std::{future::poll_fn, sync::atomic::Ordering, sync::Arc};
+use std::{
+    collections::{hash_map::Entry as HashMapEntry, HashMap, VecDeque},
+    future::poll_fn,
+    sync::atomic::Ordering,
+    sync::Arc,
+};
 
 use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use either::Either;
 use futures_concurrency::future::Race;
-use futures_util::Future;
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, Future, FutureExt, StreamExt};
 use tokio::sync::{
     broadcast,
     mpsc::{UnboundedReceiver, UnboundedSender},
@@ -16,6 +21,11 @@ use crate::{
     pg_client::PgClient,
     pg_pubsub_connection::{Command, Listener, Notification},
 };
+
+/// Boxed future used by the funnel's `FuturesUnordered`. Each future processes one
+/// `Command` and resolves to the channel it ran on, so the funnel knows which per-channel
+/// queue to advance.
+type CmdFuture = BoxFuture<'static, Box<str>>;
 
 type PollResult = Either<Option<Result<AsyncMessage, tokio_postgres::Error>>, ()>;
 
@@ -201,20 +211,31 @@ pub(crate) fn dispatch_notification(
     }
 }
 
-/// Single task that funnels every LISTEN and UNLISTEN command through one queue, owning
-/// `pg_client` exclusively for those operations. Serial processing means LISTEN and
-/// UNLISTEN reach the connection in the order their `Command`s were enqueued — `listen()`
-/// enqueues its `Listen` while still holding the DashMap shard lock, and `Subscription`
-/// drop / rollback enqueue `Unsub` likewise (the shard lock is taken inside this task for
-/// the refcount work). Combined, that fixes the historical race where a concurrent
-/// `listen()` could slip its LISTEN in front of an in-flight UNLISTEN.
+/// Funnel task: owns `pg_client` exclusively for LISTEN/UNLISTEN, with **per-channel
+/// ordering** but **cross-channel concurrency**.
 ///
-/// UNLISTEN is best-effort — if the immediate attempt in `Unsub` fails we rely on the
-/// listener task to detect the leak (a notification arriving for a channel that's no
-/// longer in `listener_map`) and enqueue an `UnlistenIfEmpty`, which we process here. A
-/// concurrent re-subscribe for the same channel is safe because its `Listen` simply waits
-/// behind us in the queue, so the server state is correct regardless of the order in
-/// which the in-flight UNLISTEN and the new LISTEN actually land.
+/// - Per channel, commands are processed strictly in enqueue order. If an op for "foo" is
+///   in flight when another command for "foo" arrives, the new one queues behind it.
+///   Combined with `listen()` enqueueing its `Listen` under the DashMap shard lock, this
+///   means the server-side LISTEN/UNLISTEN ordering for any given channel matches the
+///   shard-lock acquisition order — which is what eliminates the historical race where a
+///   concurrent `listen()` could slip its LISTEN in front of an in-flight UNLISTEN.
+/// - Across channels, ops run concurrently. `tokio_postgres::Client` pipelines requests on
+///   the connection, so a `Listen "foo"` doesn't block a `Listen "bar"`.
+///
+/// The two halves of the funnel state:
+/// - `queues`: `HashMap<channel, VecDeque<Command>>`. An entry is present iff there is an
+///   op for that channel either in flight (`FuturesUnordered`) or queued. The deque holds
+///   commands waiting for the in-flight op to finish.
+/// - `in_flight`: a `FuturesUnordered` of `process_command(...)` futures, polled
+///   cooperatively by the funnel task itself (no `tokio::spawn`). Each future resolves to
+///   the channel it ran on, so we know which queue to advance.
+///
+/// UNLISTEN remains best-effort — if the attempt in `Unsub` fails we rely on the listener
+/// task to detect the leak via a stray notification and enqueue `UnlistenIfEmpty`, which
+/// the funnel processes here. Per-channel queueing means a concurrent re-subscribe for
+/// the same channel waits behind any in-flight `UnlistenIfEmpty`, so server state ends
+/// consistent.
 ///
 /// `notify()` and `get_pid()` continue to call `pg_client` directly — they don't compete
 /// for ordering and would only pay extra latency for going through the funnel.
@@ -224,57 +245,124 @@ pub(crate) async fn command_task(
     pending_unlisten: Arc<DashSet<Box<str>>>,
     pg_client: Arc<PgClient>,
 ) {
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            Command::Listen { channel, response } => {
-                log::debug!("Listening to channel {channel}");
-                let result = pg_client.listen(&channel).await;
-                if response.send(result).is_err() {
-                    log::debug!("Listen response dropped (caller cancelled)");
+    let mut queues: HashMap<Box<str>, VecDeque<Command>> = HashMap::new();
+    let mut in_flight: FuturesUnordered<CmdFuture> = FuturesUnordered::new();
+
+    let spawn_op = |cmd: Command, in_flight: &mut FuturesUnordered<CmdFuture>| {
+        let lm = Arc::clone(&listener_map);
+        let pu = Arc::clone(&pending_unlisten);
+        let pc = Arc::clone(&pg_client);
+        in_flight.push(process_command(cmd, lm, pu, pc).boxed());
+    };
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { break; };
+                let key: Box<str> = cmd.channel().into();
+                match queues.entry(key) {
+                    HashMapEntry::Occupied(mut e) => {
+                        // An op for this channel is already in flight; queue behind it
+                        // so per-channel ordering is preserved.
+                        e.get_mut().push_back(cmd);
+                    }
+                    HashMapEntry::Vacant(e) => {
+                        // No in-flight op for this channel — start it immediately and
+                        // mark the channel as occupied with an empty backlog.
+                        e.insert(VecDeque::new());
+                        spawn_op(cmd, &mut in_flight);
+                    }
                 }
             }
-            Command::Unsub { channel } => {
-                let should_unlisten = match listener_map.entry(channel.clone()) {
-                    Entry::Occupied(occ) => {
-                        let prev = occ.get().listener_count.fetch_sub(1, Ordering::AcqRel);
-                        assert!(prev > 0);
-                        if prev == 1 {
-                            occ.remove();
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    Entry::Vacant(_) => {
-                        log::warn!("Unsub for non-existent channel {channel}");
+            Some(channel) = in_flight.next(), if !in_flight.is_empty() => {
+                advance_queue(&channel, &mut queues, &mut in_flight, &spawn_op);
+            }
+        }
+    }
+
+    // cmd_rx closed; finish what's in flight (and what's queued behind it) so we don't
+    // drop oneshot acks on the floor for callers that haven't been cancelled.
+    while let Some(channel) = in_flight.next().await {
+        advance_queue(&channel, &mut queues, &mut in_flight, &spawn_op);
+    }
+}
+
+/// Pops the next command for `channel` (if any) and starts processing it; otherwise
+/// removes the channel's empty queue entry to free space.
+fn advance_queue(
+    channel: &str,
+    queues: &mut HashMap<Box<str>, VecDeque<Command>>,
+    in_flight: &mut FuturesUnordered<CmdFuture>,
+    spawn_op: &impl Fn(Command, &mut FuturesUnordered<CmdFuture>),
+) {
+    let next = queues.get_mut(channel).and_then(|q| q.pop_front());
+    match next {
+        Some(cmd) => spawn_op(cmd, in_flight),
+        None => {
+            queues.remove(channel);
+        }
+    }
+}
+
+/// Processes a single `Command`. Returns the channel name so the funnel can advance the
+/// per-channel queue once this future completes.
+async fn process_command(
+    cmd: Command,
+    listener_map: Arc<DashMap<Box<str>, Listener>>,
+    pending_unlisten: Arc<DashSet<Box<str>>>,
+    pg_client: Arc<PgClient>,
+) -> Box<str> {
+    match cmd {
+        Command::Listen { channel, response } => {
+            log::debug!("Listening to channel {channel}");
+            let result = pg_client.listen(&channel).await;
+            if response.send(result).is_err() {
+                log::debug!("Listen response dropped (caller cancelled)");
+            }
+            channel
+        }
+        Command::Unsub { channel } => {
+            let should_unlisten = match listener_map.entry(channel.clone()) {
+                Entry::Occupied(occ) => {
+                    let prev = occ.get().listener_count.fetch_sub(1, Ordering::AcqRel);
+                    assert!(prev > 0);
+                    if prev == 1 {
+                        occ.remove();
+                        true
+                    } else {
                         false
                     }
-                };
-
-                if should_unlisten {
-                    log::debug!("Unlistening from {channel}");
-                    if let Err(err) = pg_client.unlisten(&channel).await {
-                        log::warn!(
-                            "UNLISTEN {channel} failed: {err}; \
-                             will retry if a notification arrives for it"
-                        );
-                    }
+                }
+                Entry::Vacant(_) => {
+                    log::warn!("Unsub for non-existent channel {channel}");
+                    false
+                }
+            };
+            if should_unlisten {
+                log::debug!("Unlistening from {channel}");
+                if let Err(err) = pg_client.unlisten(&channel).await {
+                    log::warn!(
+                        "UNLISTEN {channel} failed: {err}; \
+                         will retry if a notification arrives for it"
+                    );
                 }
             }
-            Command::UnlistenIfEmpty { channel } => {
-                if !listener_map.contains_key(&channel) {
-                    log::debug!("Reactive UNLISTEN for {channel}");
-                    if let Err(err) = pg_client.unlisten(&channel).await {
-                        log::warn!("Reactive UNLISTEN {channel} failed: {err}");
-                    }
-                } else {
-                    log::debug!("Skipping reactive UNLISTEN for {channel}: re-subscribed");
+            channel
+        }
+        Command::UnlistenIfEmpty { channel } => {
+            if !listener_map.contains_key(&channel) {
+                log::debug!("Reactive UNLISTEN for {channel}");
+                if let Err(err) = pg_client.unlisten(&channel).await {
+                    log::warn!("Reactive UNLISTEN {channel} failed: {err}");
                 }
-                // Clear the dedupe slot last so any notifications that arrived during our
-                // await re-trigger only after we've finished — bounding the retry rate to
-                // one attempt per round-trip.
-                pending_unlisten.remove(&channel);
+            } else {
+                log::debug!("Skipping reactive UNLISTEN for {channel}: re-subscribed");
             }
+            // Clear the dedupe slot last so any notifications that arrived during our
+            // await re-trigger only after we've finished — bounding the retry rate to
+            // one attempt per round-trip per channel.
+            pending_unlisten.remove(&channel);
+            channel
         }
     }
 }

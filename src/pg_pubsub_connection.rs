@@ -22,9 +22,10 @@ pub struct PgPubSubConnection {
     tasks: JoinSet<()>,
 }
 
-/// Work item processed by `command_task`. Issuing LISTEN/UNLISTEN through a single
-/// serialised queue is what eliminates the LISTEN-vs-UNLISTEN ordering race; see the
-/// docstring on `command_task` for details.
+/// Work item processed by `command_task`. The funnel preserves per-channel ordering
+/// (commands targeting the same channel are processed serially) while running commands
+/// for different channels concurrently — see the docstring on `command_task` for
+/// details.
 pub(crate) enum Command {
     Listen {
         channel: Box<str>,
@@ -41,6 +42,18 @@ pub(crate) enum Command {
     UnlistenIfEmpty {
         channel: Box<str>,
     },
+}
+
+impl Command {
+    /// The channel this command targets. Used by the funnel to dispatch to the correct
+    /// per-channel queue.
+    pub(crate) fn channel(&self) -> &str {
+        match self {
+            Command::Listen { channel, .. }
+            | Command::Unsub { channel }
+            | Command::UnlistenIfEmpty { channel } => channel,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

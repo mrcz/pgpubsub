@@ -17,5 +17,5 @@ futures-util = "0.3.32"
 log = "0.4.29"
 postgres-protocol = "0.6.11"
 rand = { version = "0.10.0", default-features = false, features = ["std", "sys_rng"] }
-tokio = { version = "1.50.0", features = ["rt", "time"] }
+tokio = { version = "1.50.0", features = ["macros", "rt", "time"] }
 tokio-postgres = "0.7.17"
