@@ -241,6 +241,11 @@ impl PgPubSubConnection {
                     listener_count: AtomicUsize::new(0),
                 }
             });
+            // Relaxed is sufficient because every access to listener_count (this fetch_add
+            // here, the fetch_sub in unsubscription_task, and the load inside its remove_if
+            // predicate) happens while holding the DashMap shard lock. The lock's
+            // release/acquire chain provides the happens-before relationship; if this access
+            // is ever moved outside the shard lock, the ordering must be revisited.
             let prev = entry.listener_count.fetch_add(1, Ordering::Relaxed);
             let receiver = entry.send_channel.subscribe();
             (receiver, prev == 0)
