@@ -56,7 +56,7 @@ impl PgPubSubOptionsBuilder {
         }
     }
 
-    /// Sets the capacities of the channels that deliver notifications and database commands.
+    /// Sets the per-channel capacity of the broadcast channel that delivers notifications.
     pub fn channel_capacity(self, channel_capacity: usize) -> Self {
         Self {
             channel_capacity,
@@ -108,8 +108,15 @@ struct LibpqValue<'a> {
 }
 
 impl<'a> LibpqValue<'a> {
-    #[inline(never)]
     fn from_str(input: &'a str) -> Self {
+        // Empty values must be quoted as `''` so libpq parses them as an explicit empty
+        // value rather than treating the key as missing.
+        if input.is_empty() {
+            return LibpqValue {
+                value: Either::Left("''".to_owned()),
+            };
+        }
+
         let mut contains_spaces = false;
         let mut escape_count = 0;
         for ch in input.chars() {
@@ -130,29 +137,23 @@ impl<'a> LibpqValue<'a> {
 
         let mut output = String::with_capacity(output_len);
 
-        let quote = contains_spaces || input.is_empty();
-
-        if quote {
-            output.push('\''); // The leading single quote.
+        if contains_spaces {
+            output.push('\'');
         }
 
         if escape_count == 0 {
-            // Nothing to escape, just copy all of input into output.
             output.push_str(input);
         } else {
-            // Otherwise go through each character in input and escape if needed.
             for ch in input.chars() {
                 if ch == '\\' || ch == '\'' {
                     output.push('\\');
-                    output.push(ch);
-                } else {
-                    output.push(ch);
                 }
+                output.push(ch);
             }
         }
 
-        if quote {
-            output.push('\''); // The trailing single quote.
+        if contains_spaces {
+            output.push('\'');
         }
 
         debug_assert_eq!(output.len(), output_len);
@@ -162,7 +163,7 @@ impl<'a> LibpqValue<'a> {
         }
     }
 
-    pub fn as_str(&'a self) -> &'a str {
+    fn as_str(&self) -> &str {
         match &self.value {
             Either::Left(s) => s,
             Either::Right(s) => s,
@@ -170,18 +171,9 @@ impl<'a> LibpqValue<'a> {
     }
 }
 
-impl From<LibpqValue<'_>> for String {
-    fn from(v: LibpqValue<'_>) -> Self {
-        match v.value {
-            Either::Left(s) => s,
-            Either::Right(s) => s.to_owned(),
-        }
-    }
-}
-
 impl std::fmt::Display for LibpqValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{s}", s = self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -220,6 +212,14 @@ mod test {
         assert!(!ptr::eq(input, output));
         // The string should be enclosed in single quotes.
         assert_eq!(output, "'secret 123'");
+    }
+
+    #[test]
+    fn lib_pq_value_fmt_empty_is_quoted() {
+        let v = LibpqValue::from_str("");
+        // Empty values must be wrapped in '' so libpq parses them as explicit empty rather
+        // than treating the key as missing.
+        assert_eq!(v.as_str(), "''");
     }
 
     #[test]
