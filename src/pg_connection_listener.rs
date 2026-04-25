@@ -55,11 +55,12 @@ where
     (f1, f2).race().await
 }
 
-/// Creates the connection listener future and optionally returns a oneshot sender
-/// for the backend PID (needed when `suppress_own_notifications` is true).
+/// Builds the connection listener future and, when `suppress_own_notifications` is true,
+/// also returns a oneshot sender used to deliver the backend PID to the listener.
 ///
-/// The caller must spawn the returned future BEFORE sending the PID, since the
-/// connection must be polled for the `get_pid` query to complete.
+/// The future drives the underlying tokio-postgres connection, so any query (including
+/// the `pg_backend_pid()` lookup that produces the PID) needs the future to be polled —
+/// typically by spawning it on the runtime — before it can complete.
 pub(crate) fn create_listener_task<T>(
     mut connection: Connection<Socket, <T as MakeTlsConnect<Socket>>::Stream>,
     listener_map: Arc<DashMap<Box<str>, Listener>>,

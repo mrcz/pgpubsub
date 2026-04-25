@@ -68,7 +68,7 @@ impl Drop for ListenRollbackGuard<'_> {
 ///
 /// This type is `Send + 'static` and can be used with `tokio::spawn`.
 pub struct Subscription {
-    channel: String,
+    channel: Box<str>,
     receiver: broadcast::Receiver<Notification>,
     unsub_tx: mpsc::UnboundedSender<Box<str>>,
 }
@@ -115,7 +115,8 @@ impl std::error::Error for RecvError {}
 impl Drop for Subscription {
     fn drop(&mut self) {
         log::debug!("Unsubscribing from channel {channel}", channel = self.channel);
-        if let Err(err) = self.unsub_tx.send(self.channel.as_str().into()) {
+        let channel = std::mem::take(&mut self.channel);
+        if let Err(err) = self.unsub_tx.send(channel) {
             log::error!("Error when unsubscribing: {err}");
         }
     }
