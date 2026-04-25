@@ -358,3 +358,76 @@ impl PgPubSubConnection {
         (1..=63).contains(&channel.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_channel_returns_target_for_each_variant() {
+        let (response_tx, _response_rx) = oneshot::channel();
+        let listen = Command::Listen {
+            channel: "alpha".into(),
+            response: response_tx,
+        };
+        assert_eq!(listen.channel(), "alpha");
+
+        let unsub = Command::Unsub {
+            channel: "beta".into(),
+        };
+        assert_eq!(unsub.channel(), "beta");
+
+        let unlisten = Command::UnlistenIfEmpty {
+            channel: "gamma".into(),
+        };
+        assert_eq!(unlisten.channel(), "gamma");
+    }
+
+    #[test]
+    fn rollback_guard_drops_into_unsub_when_armed() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        {
+            let _guard = ListenRollbackGuard {
+                key: Some("foo".into()),
+                cmd_tx: &cmd_tx,
+            };
+        } // guard drops here, should send Command::Unsub
+
+        match cmd_rx.try_recv().expect("expected an Unsub on guard drop") {
+            Command::Unsub { channel } => assert_eq!(&*channel, "foo"),
+            _ => panic!("expected Command::Unsub variant"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "exactly one command expected");
+    }
+
+    #[test]
+    fn rollback_guard_is_silent_after_disarm() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        {
+            let guard = ListenRollbackGuard {
+                key: Some("foo".into()),
+                cmd_tx: &cmd_tx,
+            };
+            guard.disarm();
+            // Drop happens at end of scope; key is None now, so no send.
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "disarmed guard must not send anything on drop"
+        );
+    }
+
+    #[test]
+    fn rollback_guard_logs_but_does_not_panic_when_funnel_is_gone() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        // Drop the receiver first so cmd_tx.send fails.
+        drop(cmd_rx);
+
+        // The guard's Drop logs the failure but must not panic — exercised by simply
+        // letting this scope end without a panic.
+        let _guard = ListenRollbackGuard {
+            key: Some("foo".into()),
+            cmd_tx: &cmd_tx,
+        };
+    }
+}

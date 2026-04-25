@@ -199,4 +199,74 @@ mod test {
             true,
         );
     }
+
+    /// Helper: build a backoff with no jitter for deterministic assertions.
+    fn deterministic(start_ms: u64, max_ms: u64, factor: f32) -> ExponentialBackoff {
+        ExponentialBackoff::with_params(
+            Duration::from_millis(start_ms),
+            Duration::from_millis(max_ms),
+            factor,
+            0.0,
+            false,
+        )
+    }
+
+    /// Durations round-trip through `f32` with sub-microsecond drift, so equality
+    /// comparisons use this tolerance.
+    fn assert_close(actual: Duration, expected_ms: u64) {
+        let drift = if actual >= Duration::from_millis(expected_ms) {
+            actual - Duration::from_millis(expected_ms)
+        } else {
+            Duration::from_millis(expected_ms) - actual
+        };
+        assert!(
+            drift < Duration::from_micros(10),
+            "expected ~{expected_ms}ms, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn first_fail_returns_start_duration_and_advances_current() {
+        let mut b = deterministic(100, 5_000, 2.0);
+        let slept = b.fail();
+        assert_close(slept, 100);
+        // current_duration is the next sleep target; after one failure it has been
+        // multiplied by the backoff factor (100 * 2.0 = 200ms = 0.2s).
+        assert!((b.current_duration - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fail_returns_zero_until_reset() {
+        // The intent of `has_slept_since_last_fail` is that a single failure round
+        // produces a single sleep — repeated fail() calls without an intervening
+        // reset() return ZERO (no further sleeping).
+        let mut b = deterministic(100, 5_000, 2.0);
+        assert_close(b.fail(), 100);
+        assert_eq!(b.fail(), Duration::ZERO);
+        assert_eq!(b.fail(), Duration::ZERO);
+
+        b.reset();
+        assert_close(b.fail(), 100);
+    }
+
+    #[test]
+    fn reset_returns_current_to_start() {
+        let mut b = deterministic(100, 5_000, 2.0);
+        let _ = b.fail();
+        // current_duration was advanced to 0.2s.
+        b.reset();
+        // After reset, current_duration is back to start and the next fail() returns
+        // the start duration again — proving the progression isn't sticky.
+        assert!((b.current_duration - 0.1).abs() < 1e-6);
+        assert_close(b.fail(), 100);
+    }
+
+    #[test]
+    fn current_duration_is_capped_at_max() {
+        // With factor 10 and start 100ms, the next current_duration would be 1000ms,
+        // but max is 500ms — so it should be clamped.
+        let mut b = deterministic(100, 500, 10.0);
+        let _ = b.fail();
+        assert!((b.current_duration - 0.5).abs() < 1e-6);
+    }
 }

@@ -521,4 +521,42 @@ mod tests {
         // failed enqueue. (The funnel never receives anything anyway.)
         assert!(!f.pending_unlisten.contains("foo"));
     }
+
+    #[test]
+    fn dedupe_is_per_channel_not_global() {
+        // The funnel relies on per-channel queueing, which in turn relies on the dedupe
+        // set being per-channel. Two stray notifications for two distinct channels must
+        // produce two distinct UnlistenIfEmpty commands and two distinct dedupe entries.
+        let mut f = fixture();
+
+        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification("bar", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+
+        let mut channels: Vec<String> = Vec::new();
+        while let Ok(cmd) = f.cmd_rx.try_recv() {
+            match cmd {
+                Command::UnlistenIfEmpty { channel } => channels.push(String::from(channel)),
+                _ => panic!("unexpected command variant"),
+            }
+        }
+        channels.sort();
+        assert_eq!(channels, vec!["bar".to_string(), "foo".to_string()]);
+        assert!(f.pending_unlisten.contains("foo"));
+        assert!(f.pending_unlisten.contains("bar"));
+    }
+
+    #[test]
+    fn known_channel_with_empty_payload_broadcasts_empty_string() {
+        // Per Notification's docs, a NOTIFY with no payload becomes the empty string
+        // (not None / not absent). Verify that contract on the dispatch path.
+        let f = fixture();
+        let mut receiver = insert_listener(&f.listener_map, "foo", 1);
+
+        dispatch_notification("foo", "", 9, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+
+        let n = receiver.try_recv().expect("notification was not broadcast");
+        assert_eq!(&*n.channel, "foo");
+        assert_eq!(&*n.payload, "");
+        assert_eq!(n.process_id, 9);
+    }
 }
