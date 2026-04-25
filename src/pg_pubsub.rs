@@ -1,6 +1,3 @@
-use std::sync::Arc;
-
-use tokio::sync::broadcast;
 use tokio_postgres::{tls::MakeTlsConnect, Socket};
 
 use crate::{
@@ -25,18 +22,7 @@ impl PgPubSub {
         T: MakeTlsConnect<Socket> + Clone + Send + 'static,
         <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
     {
-        // Create the listener map and share it between sender and receiver.
-        let listener_map = Default::default();
-
-        let (disconnect_sx, disconnect_rx) = broadcast::channel(1);
-        let connection = PgPubSubConnection::connect(
-            options,
-            Arc::clone(&listener_map),
-            disconnect_sx,
-            disconnect_rx,
-        )
-        .await?;
-
+        let connection = PgPubSubConnection::connect(options).await?;
         Ok(Self { connection })
     }
 

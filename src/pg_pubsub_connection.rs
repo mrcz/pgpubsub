@@ -157,9 +157,6 @@ impl PgPubSubConnection {
     /// spawned in the background using the configuration of the current Tokio Runtime.
     pub(crate) async fn connect<T>(
         options: PgPubSubOptions<T>,
-        listener_map: Arc<DashMap<Box<str>, Listener>>,
-        disconnected_sx: broadcast::Sender<()>,
-        disconnected_rx: broadcast::Receiver<()>,
     ) -> Result<Self, tokio_postgres::Error>
     where
         T: MakeTlsConnect<Socket> + Clone + Send + 'static,
@@ -175,6 +172,9 @@ impl PgPubSubConnection {
             ConnectionParameters::ConnectionStr(s) => connect(&s, options.tls).await?,
             ConnectionParameters::TokioPostgresConfig(cfg) => cfg.connect(options.tls).await?,
         };
+
+        let listener_map: Arc<DashMap<Box<str>, Listener>> = Default::default();
+        let (disconnected_sx, disconnected_rx) = broadcast::channel(1);
 
         let pg_client = Arc::new(PgClient::new(client));
         let (unsub_tx, unsub_rx) = mpsc::unbounded_channel();
@@ -234,7 +234,7 @@ impl PgPubSubConnection {
         // below so concurrent operations on the same shard are not blocked on the round-trip.
         let (receiver, is_new) = {
             let entry = self.listeners.entry(key.clone()).or_insert_with(|| {
-                let (sender, _receiver) = broadcast::channel(self.channel_capacity);
+                let (sender, _) = broadcast::channel(self.channel_capacity);
                 Listener {
                     send_channel: sender,
                     listener_count: AtomicUsize::new(0),
