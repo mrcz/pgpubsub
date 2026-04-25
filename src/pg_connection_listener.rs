@@ -1,10 +1,14 @@
 use std::{future::poll_fn, sync::atomic::Ordering, sync::Arc};
 
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use either::Either;
 use futures_concurrency::future::Race;
 use futures_util::Future;
-use tokio::sync::{broadcast, mpsc::UnboundedReceiver, oneshot};
+use tokio::sync::{
+    broadcast,
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use tokio_postgres::{tls::MakeTlsConnect, AsyncMessage, Connection, Socket};
 
 use crate::{
@@ -12,11 +16,6 @@ use crate::{
     pg_client::PgClient,
     pg_pubsub_connection::{Command, Listener, Notification},
 };
-
-/// Maximum number of UNLISTEN attempts in `command_task` before giving up. With the default
-/// exponential backoff (100ms start, 5s max, 1.8 factor) this is on the order of ~10s of
-/// retrying for a single channel.
-const MAX_UNLISTEN_RETRIES: usize = 5;
 
 type PollResult = Either<Option<Result<AsyncMessage, tokio_postgres::Error>>, ()>;
 
@@ -66,9 +65,12 @@ where
 /// The future drives the underlying tokio-postgres connection, so any query (including
 /// the `pg_backend_pid()` lookup that produces the PID) needs the future to be polled —
 /// typically by spawning it on the runtime — before it can complete.
+#[allow(clippy::too_many_arguments)] // Internal function, all args are necessary.
 pub(crate) fn create_listener_task<T>(
     mut connection: Connection<Socket, <T as MakeTlsConnect<Socket>>::Stream>,
     listener_map: Arc<DashMap<Box<str>, Listener>>,
+    pending_unlisten: Arc<DashSet<Box<str>>>,
+    cmd_tx: UnboundedSender<Command>,
     suppress_own_notifications: bool,
     mut backoff: ExponentialBackoff,
     disconnected_sx: broadcast::Sender<()>,
@@ -140,6 +142,25 @@ where
                                 channel = msg.channel(),
                             )
                         }
+                    } else {
+                        // Notification for a channel we don't track. Most often this is the
+                        // tail of a teardown (the server hasn't fully processed our UNLISTEN
+                        // yet); occasionally it means an UNLISTEN failed and we still have
+                        // server-side LISTEN state. Either way, ask the funnel to UNLISTEN
+                        // if the entry is still empty when it gets there. The dedupe set
+                        // coalesces bursts so we don't enqueue one per stray notification.
+                        let channel: Box<str> = msg.channel().into();
+                        if pending_unlisten.insert(channel.clone())
+                            && cmd_tx
+                                .send(Command::UnlistenIfEmpty {
+                                    channel: channel.clone(),
+                                })
+                                .is_err()
+                        {
+                            // Funnel is gone; whole connection is shutting down. Roll the
+                            // dedupe set back so we don't leak a placeholder entry.
+                            pending_unlisten.remove(&channel);
+                        }
                     }
                 }
                 Ok(AsyncMessage::Notice(db_error)) => {
@@ -168,14 +189,21 @@ where
 /// enqueues its `Listen` while still holding the DashMap shard lock, and `Subscription`
 /// drop / rollback enqueue `Unsub` likewise (the shard lock is taken inside this task for
 /// the refcount work). Combined, that fixes the historical race where a concurrent
-/// `listen()` could slip its LISTEN in front of an in-flight UNLISTEN, and makes UNLISTEN
-/// retries safe (any later LISTEN simply waits behind us in the queue).
+/// `listen()` could slip its LISTEN in front of an in-flight UNLISTEN.
+///
+/// UNLISTEN is best-effort — if the immediate attempt in `Unsub` fails we rely on the
+/// listener task to detect the leak (a notification arriving for a channel that's no
+/// longer in `listener_map`) and enqueue an `UnlistenIfEmpty`, which we process here. A
+/// concurrent re-subscribe for the same channel is safe because its `Listen` simply waits
+/// behind us in the queue, so the server state is correct regardless of the order in
+/// which the in-flight UNLISTEN and the new LISTEN actually land.
 ///
 /// `notify()` and `get_pid()` continue to call `pg_client` directly — they don't compete
 /// for ordering and would only pay extra latency for going through the funnel.
 pub(crate) async fn command_task(
     mut cmd_rx: UnboundedReceiver<Command>,
     listener_map: Arc<DashMap<Box<str>, Listener>>,
+    pending_unlisten: Arc<DashSet<Box<str>>>,
     pg_client: Arc<PgClient>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
@@ -206,36 +234,29 @@ pub(crate) async fn command_task(
                 };
 
                 if should_unlisten {
-                    unlisten_with_retry(&channel, &pg_client, &listener_map).await;
+                    log::debug!("Unlistening from {channel}");
+                    if let Err(err) = pg_client.unlisten(&channel).await {
+                        log::warn!(
+                            "UNLISTEN {channel} failed: {err}; \
+                             will retry if a notification arrives for it"
+                        );
+                    }
                 }
             }
-        }
-    }
-}
-
-/// Attempts UNLISTEN with bounded exponential backoff. Aborts early if a concurrent
-/// `listen()` reclaims the entry — in that case the queued LISTEN behind us will run as
-/// soon as we return, leaving the server in the right state regardless of whether the
-/// final UNLISTEN attempt landed before we saw the new entry.
-async fn unlisten_with_retry(
-    channel: &str,
-    pg_client: &PgClient,
-    listener_map: &DashMap<Box<str>, Listener>,
-) {
-    let mut backoff = ExponentialBackoff::default();
-    for attempt in 1..=MAX_UNLISTEN_RETRIES {
-        log::debug!("Unlistening from {channel} (attempt {attempt}/{MAX_UNLISTEN_RETRIES})");
-        match pg_client.unlisten(channel).await {
-            Ok(()) => return,
-            Err(err) => {
-                log::warn!("UNLISTEN {channel} attempt {attempt} failed: {err}");
+            Command::UnlistenIfEmpty { channel } => {
+                if !listener_map.contains_key(&channel) {
+                    log::debug!("Reactive UNLISTEN for {channel}");
+                    if let Err(err) = pg_client.unlisten(&channel).await {
+                        log::warn!("Reactive UNLISTEN {channel} failed: {err}");
+                    }
+                } else {
+                    log::debug!("Skipping reactive UNLISTEN for {channel}: re-subscribed");
+                }
+                // Clear the dedupe slot last so any notifications that arrived during our
+                // await re-trigger only after we've finished — bounding the retry rate to
+                // one attempt per round-trip.
+                pending_unlisten.remove(&channel);
             }
         }
-        if listener_map.contains_key(channel) {
-            log::debug!("Aborting UNLISTEN retry for {channel}: re-subscribed");
-            return;
-        }
-        backoff.fail_and_sleep().await;
     }
-    log::error!("Giving up on UNLISTEN for {channel} after {MAX_UNLISTEN_RETRIES} attempts");
 }

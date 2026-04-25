@@ -1,7 +1,7 @@
 use crate::exponential_backoff::ExponentialBackoff;
 use crate::pg_connection_listener::{command_task, create_listener_task};
 use crate::tokio_postgres::{MakeTlsConnect, Socket};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,14 @@ pub(crate) enum Command {
         response: oneshot::Sender<Result<(), tokio_postgres::Error>>,
     },
     Unsub {
+        channel: Box<str>,
+    },
+    /// Issued by the listener task when a notification arrives for a channel that's no
+    /// longer in `listener_map`. The funnel re-checks the map and, if it's still empty,
+    /// sends UNLISTEN. This is the recovery path for an UNLISTEN that failed earlier in
+    /// `Unsub` — we leave proactive retries to be triggered by the next stray
+    /// notification rather than a timer.
+    UnlistenIfEmpty {
         channel: Box<str>,
     },
 }
@@ -192,6 +200,7 @@ impl PgPubSubConnection {
         };
 
         let listener_map: Arc<DashMap<Box<str>, Listener>> = Default::default();
+        let pending_unlisten: Arc<DashSet<Box<str>>> = Default::default();
         let (disconnected_sx, disconnected_rx) = broadcast::channel(1);
 
         let pg_client = Arc::new(PgClient::new(client));
@@ -200,6 +209,8 @@ impl PgPubSubConnection {
         let (listener_future, backend_pid_sx) = create_listener_task::<T>(
             connection,
             Arc::clone(&listener_map),
+            Arc::clone(&pending_unlisten),
+            cmd_tx.clone(),
             options.suppress_own_notifications,
             backoff,
             disconnected_sx,
@@ -227,7 +238,7 @@ impl PgPubSubConnection {
         let cmd_pg_client = Arc::clone(&pg_client);
         let cmd_listener_map = Arc::clone(&listener_map);
         tasks.spawn(async move {
-            command_task(cmd_rx, cmd_listener_map, cmd_pg_client).await;
+            command_task(cmd_rx, cmd_listener_map, pending_unlisten, cmd_pg_client).await;
         });
 
         Ok(PgPubSubConnection {
