@@ -60,9 +60,14 @@ impl Command {
 /// Notification will be received when a NOTIFY command was sent on a channel that the client
 /// listens to. If there was no payload, the corresponding member will be set to the empty string
 /// (and not None for example).
+///
+/// `channel` and `payload` are stored as `Arc<str>` so that broadcasting to multiple
+/// subscribers and the per-receiver `Clone` on `recv()` are cheap atomic-refcount bumps
+/// rather than allocations. The fields deref to `&str`, so existing code that just reads
+/// or formats them keeps working unchanged.
 pub struct Notification {
-    pub channel: Box<str>,
-    pub payload: Box<str>,
+    pub channel: Arc<str>,
+    pub payload: Arc<str>,
     pub process_id: i32,
 }
 
@@ -341,6 +346,17 @@ impl PgPubSubConnection {
 
     pub async fn notify(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {
         self.notify_cmd(channel, payload).await
+    }
+
+    pub async fn notify_batch(
+        &self,
+        items: &[(&str, Option<&str>)],
+    ) -> Result<(), PubSubError> {
+        log::debug!("Notifying batch of {} items", items.len());
+        self.pg_client
+            .notify_batch(items)
+            .await
+            .map_err(PubSubError::NotifyError)
     }
 
     async fn notify_cmd(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {
