@@ -57,6 +57,7 @@ impl Command {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 /// Notification will be received when a NOTIFY command was sent on a channel that the client
 /// listens to. If there was no payload, the corresponding member will be set to the empty string
 /// (and not None for example).
@@ -65,6 +66,9 @@ impl Command {
 /// subscribers and the per-receiver `Clone` on `recv()` are cheap atomic-refcount bumps
 /// rather than allocations. The fields deref to `&str`, so existing code that just reads
 /// or formats them keeps working unchanged.
+///
+/// Marked `#[non_exhaustive]` so future minor releases can add fields (for example, a
+/// receive timestamp) without another breaking change.
 pub struct Notification {
     pub channel: Arc<str>,
     pub payload: Arc<str>,
@@ -113,6 +117,13 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// The channel this subscription is listening to. Useful when juggling many
+    /// subscriptions in a `select_all`-style loop and you need to know which channel a
+    /// notification came from before reading the [`Notification`] itself.
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
     /// Waits for the next notification on this channel.
     ///
     /// Returns [`RecvError::Closed`] when the underlying [`PgPubSub`](crate::PgPubSub) has been
@@ -167,9 +178,10 @@ impl Drop for Subscription {
 pub enum PubSubError {
     /// Channel name is empty or exceeds 63 bytes.
     InvalidChannelName,
-    /// Failed to send a LISTEN command.
-    SendError(tokio_postgres::Error),
-    /// Failed to send a NOTIFY command.
+    /// The LISTEN command sent for [`PgPubSub::listen`](crate::PgPubSub::listen) failed.
+    ListenError(tokio_postgres::Error),
+    /// The NOTIFY command sent for [`PgPubSub::notify`](crate::PgPubSub::notify) or
+    /// [`PgPubSub::notify_batch`](crate::PgPubSub::notify_batch) failed.
     NotifyError(tokio_postgres::Error),
     /// The underlying [`PgPubSub`](crate::PgPubSub) was dropped before the operation could
     /// complete, so its background command task is no longer running.
@@ -180,8 +192,8 @@ impl std::fmt::Display for PubSubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PubSubError::InvalidChannelName => write!(f, "invalid channel name"),
-            PubSubError::SendError(e) => write!(f, "failed to send LISTEN command: {e}"),
-            PubSubError::NotifyError(e) => write!(f, "failed to send NOTIFY command: {e}"),
+            PubSubError::ListenError(e) => write!(f, "LISTEN command failed: {e}"),
+            PubSubError::NotifyError(e) => write!(f, "NOTIFY command failed: {e}"),
             PubSubError::Closed => write!(f, "PgPubSub connection closed"),
         }
     }
@@ -190,7 +202,7 @@ impl std::fmt::Display for PubSubError {
 impl std::error::Error for PubSubError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PubSubError::SendError(e) | PubSubError::NotifyError(e) => Some(e),
+            PubSubError::ListenError(e) | PubSubError::NotifyError(e) => Some(e),
             PubSubError::InvalidChannelName | PubSubError::Closed => None,
         }
     }
@@ -332,7 +344,7 @@ impl PgPubSubConnection {
         if let Some(rx) = listen_response_rx {
             rx.await
                 .map_err(|_| PubSubError::Closed)?
-                .map_err(PubSubError::SendError)?;
+                .map_err(PubSubError::ListenError)?;
         }
 
         rollback.disarm();
