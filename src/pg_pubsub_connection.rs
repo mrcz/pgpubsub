@@ -281,7 +281,7 @@ impl PgPubSubConnection {
     }
 
     pub async fn listen(&self, channel: &str) -> Result<Subscription, PubSubError> {
-        if !self.valid_channel_name(channel) {
+        if !valid_channel_name(channel) {
             return Err(PubSubError::InvalidChannelName);
         }
 
@@ -357,6 +357,9 @@ impl PgPubSubConnection {
     }
 
     pub async fn notify(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {
+        if !valid_channel_name(channel) {
+            return Err(PubSubError::InvalidChannelName);
+        }
         self.notify_cmd(channel, payload).await
     }
 
@@ -364,6 +367,15 @@ impl PgPubSubConnection {
         &self,
         items: &[(&str, Option<&str>)],
     ) -> Result<(), PubSubError> {
+        // Validate every channel up-front so a bad name never produces a partial
+        // commit — the SQL we'd build wraps the batch in BEGIN; ... COMMIT;, but
+        // catching it before we send is still better than letting Postgres reject it
+        // mid-batch.
+        for (channel, _) in items {
+            if !valid_channel_name(channel) {
+                return Err(PubSubError::InvalidChannelName);
+            }
+        }
         log::debug!("Notifying batch of {} items", items.len());
         self.pg_client
             .notify_batch(items)
@@ -382,9 +394,14 @@ impl PgPubSubConnection {
             .map_err(PubSubError::NotifyError)
     }
 
-    fn valid_channel_name(&self, channel: &str) -> bool {
-        (1..=63).contains(&channel.len())
-    }
+}
+
+/// PostgreSQL truncates identifiers (including LISTEN/NOTIFY channel names) to 63 bytes,
+/// and an empty channel is meaningless. Validate before issuing the command so the
+/// caller gets a clear `InvalidChannelName` instead of a Postgres error or silent
+/// truncation.
+fn valid_channel_name(channel: &str) -> bool {
+    (1..=63).contains(&channel.len())
 }
 
 #[cfg(test)]
@@ -457,5 +474,18 @@ mod tests {
             key: Some("foo".into()),
             cmd_tx: &cmd_tx,
         };
+    }
+
+    #[test]
+    fn valid_channel_name_accepts_one_to_sixty_three_bytes() {
+        assert!(valid_channel_name("a"));
+        assert!(valid_channel_name(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn valid_channel_name_rejects_empty_and_oversize() {
+        assert!(!valid_channel_name(""));
+        assert!(!valid_channel_name(&"a".repeat(64)));
+        assert!(!valid_channel_name(&"a".repeat(1000)));
     }
 }
