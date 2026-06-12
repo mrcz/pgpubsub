@@ -77,6 +77,9 @@ pub struct Notification {
 pub(crate) struct Listener {
     pub send_channel: broadcast::Sender<Notification>,
     pub listener_count: AtomicUsize,
+    /// The channel name, kept as an `Arc` so each dispatched [`Notification`] can clone
+    /// it with a refcount bump instead of allocating a fresh string per notification.
+    pub channel: Arc<str>,
 }
 
 /// RAII guard that rolls back a `listen()` refcount increment if the function does not
@@ -312,6 +315,7 @@ impl PgPubSubConnection {
                 Listener {
                     send_channel: sender,
                     listener_count: AtomicUsize::new(0),
+                    channel: Arc::from(channel),
                 }
             });
             // Relaxed is sufficient because every access to listener_count (this fetch_add

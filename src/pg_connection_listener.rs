@@ -280,7 +280,7 @@ pub(crate) fn dispatch_notification(
 ) {
     if let Some(sender) = listener_map.get(channel) {
         let notification = Notification {
-            channel: channel.into(),
+            channel: Arc::clone(&sender.channel),
             payload: payload.into(),
             process_id,
         };
@@ -510,6 +510,7 @@ mod tests {
             Listener {
                 send_channel: sender,
                 listener_count: AtomicUsize::new(count),
+                channel: Arc::from(channel),
             },
         );
         receiver
