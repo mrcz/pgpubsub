@@ -18,3 +18,7 @@ log = "0.4.29"
 postgres-protocol = "0.6.11"
 tokio = { version = "1.50.0", features = ["macros", "rt", "sync", "time"] }
 tokio-postgres = "0.7.17"
+
+[dev-dependencies]
+# rt-multi-thread lets doc tests and integration tests use plain #[tokio::main]/#[tokio::test].
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "sync", "time"] }

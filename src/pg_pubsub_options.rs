@@ -22,7 +22,7 @@ pub struct PgPubSubOptions<T: MakeTlsConnect<Socket> + Clone> {
 }
 
 impl PgPubSubOptionsBuilder {
-    /// Configuration for connecting to PostgresQL with the given parameters.
+    /// Configuration for connecting to PostgreSQL with the given parameters.
     pub fn new(host: &str, dbname: &str, user: &str, password: &str) -> Self {
         let connection_str = Self::build_connection_string(host, dbname, user, password);
         Self::from_connection_str(&connection_str)

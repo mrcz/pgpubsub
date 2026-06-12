@@ -3,27 +3,27 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use pgpubsub::{PgPubSub, PgPubSubOptionsBuilder, RecvError};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let options = PgPubSubOptionsBuilder::new("localhost", "mydb", "user", "pass")
-//!     .channel_capacity(16)
-//!     .build();
+//!     let options = PgPubSubOptionsBuilder::new("localhost", "mydb", "user", "pass")
+//!         .channel_capacity(16)
+//!         .build();
 //!
-//! let pubsub = PgPubSub::connect(options).await?;
-//! let mut subscription = pubsub.listen("my_channel").await?;
+//!     let pubsub = PgPubSub::connect(options).await?;
+//!     let mut subscription = pubsub.listen("my_channel").await?;
 //!
-//! loop {
-//!     match subscription.recv().await {
-//!         Ok(n) => println!("{}: {}", n.channel, n.payload),
-//!         Err(RecvError::Lagged(n)) => eprintln!("lagged, {n} dropped"),
-//!         Err(RecvError::Closed) => break,
-//!         Err(err) => { eprintln!("{err}"); break; }
+//!     loop {
+//!         match subscription.recv().await {
+//!             Ok(n) => println!("{}: {}", n.channel, n.payload),
+//!             Err(RecvError::Lagged(n)) => eprintln!("lagged, {n} dropped"),
+//!             Err(RecvError::Closed) => break,
+//!             Err(err) => { eprintln!("{err}"); break; }
+//!         }
 //!     }
-//! }
-//! Ok(())
+//!     Ok(())
 //! }
 //! ```
 
