@@ -1,4 +1,7 @@
-use tokio_postgres::{tls::MakeTlsConnect, Socket};
+use tokio_postgres::{
+    tls::{MakeTlsConnect, TlsConnect},
+    Socket,
+};
 
 use crate::{
     pg_pubsub_connection::{PgPubSubConnection, PubSubError, Subscription},
@@ -17,10 +20,19 @@ impl PgPubSub {
     /// Connects to PostgreSQL and spawns a background listener task.
     ///
     /// Use [`PgPubSubOptionsBuilder`](crate::PgPubSubOptionsBuilder) to construct the options.
+    ///
+    /// If the connection later drops, the background task reconnects automatically with
+    /// exponential backoff and re-issues LISTEN for every channel that has active
+    /// subscriptions, so [`Subscription`]s keep working across reconnects. Notifications
+    /// published while the connection was down are lost (PostgreSQL's NOTIFY keeps no
+    /// backlog), and `listen`/`notify` calls made during the outage fail with an error
+    /// rather than waiting for the reconnect.
     pub async fn connect<T>(options: PgPubSubOptions<T>) -> Result<Self, tokio_postgres::Error>
     where
-        T: MakeTlsConnect<Socket> + Clone + Send + 'static,
+        T: MakeTlsConnect<Socket> + Clone + Send + Sync + 'static,
         <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
+        <T as MakeTlsConnect<Socket>>::TlsConnect: Send,
+        <<T as MakeTlsConnect<Socket>>::TlsConnect as TlsConnect<Socket>>::Future: Send,
     {
         let connection = PgPubSubConnection::connect(options).await?;
         Ok(Self { connection })

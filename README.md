@@ -6,11 +6,14 @@ Async PostgreSQL LISTEN/NOTIFY pub/sub client built on
 ## Features
 
 - Subscribe to PostgreSQL notification channels with automatic LISTEN/UNLISTEN management
-- Publish notifications with NOTIFY
+- Publish notifications with NOTIFY, including atomic batches via `notify_batch`
 - Suppress notifications sent by the same connection
 - Configurable broadcast channel capacity
 - TLS support via `tokio-postgres` TLS backends
-- Exponential backoff on connection errors
+- Automatic reconnection with exponential backoff (via [backon](https://docs.rs/backon)):
+  active subscriptions are re-LISTENed once the connection is restored. Notifications
+  published while the connection is down are lost — NOTIFY is fire-and-forget — and
+  `listen`/`notify` calls made during an outage fail fast with an error.
 - `Subscription` is `Send + 'static`, so it works with `tokio::spawn`
 
 ## Usage

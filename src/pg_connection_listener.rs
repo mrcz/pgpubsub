@@ -3,23 +3,20 @@ use std::{
     future::poll_fn,
     sync::atomic::Ordering,
     sync::Arc,
+    time::Duration,
 };
 
+use backon::{BackoffBuilder, ExponentialBuilder};
 use dashmap::{mapref::entry::Entry, DashMap, DashSet};
-use either::Either;
-use futures_concurrency::future::Race;
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, Future, FutureExt, StreamExt};
-use tokio::sync::{
-    broadcast,
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    oneshot,
-};
-use tokio_postgres::{tls::MakeTlsConnect, AsyncMessage, Connection, Socket};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_postgres::{tls::MakeTlsConnect, AsyncMessage, Client, Connection, Socket};
 
 use crate::{
-    exponential_backoff::ExponentialBackoff,
-    pg_client::PgClient,
+    pg_client::{build_relisten_sql, fetch_backend_pid, PgClient},
     pg_pubsub_connection::{Command, Listener, Notification},
+    pg_pubsub_options::ConnectionParameters,
 };
 
 /// Boxed future used by the funnel's `FuturesUnordered`. Each future processes one
@@ -27,146 +24,241 @@ use crate::{
 /// queue to advance.
 type CmdFuture = BoxFuture<'static, Box<str>>;
 
-type PollResult = Either<Option<Result<AsyncMessage, tokio_postgres::Error>>, ()>;
-
-async fn poll_connection<T>(
-    connection: &mut Connection<Socket, <T as MakeTlsConnect<Socket>>::Stream>,
-) -> PollResult
-where
-    T: MakeTlsConnect<Socket>,
-    <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
-{
-    let item = poll_fn(|cx| connection.poll_message(cx)).await;
-    Either::Left(item)
+/// Shared context for routing messages arriving on the connection to subscribers.
+pub(crate) struct NotificationDispatcher {
+    pub listener_map: Arc<DashMap<Box<str>, Listener>>,
+    pub pending_unlisten: Arc<DashSet<Box<str>>>,
+    pub cmd_tx: UnboundedSender<Command>,
+    pub suppress_own_notifications: bool,
 }
 
-async fn poll_disconnect(disconnected_rx: &mut broadcast::Receiver<()>) -> PollResult {
-    match disconnected_rx.recv().await {
-        Ok(()) => {}
-        Err(broadcast::error::RecvError::Closed) => {
-            // All senders dropped; shouldn't happen since the listener task owns a sender,
-            // but treat it as a disconnect if it does.
-            log::debug!("Disconnect channel closed");
-        }
-        Err(broadcast::error::RecvError::Lagged(n)) => {
-            // Capacity-1 channel — can happen if multiple disconnects fire. Still a disconnect.
-            log::debug!("Disconnect channel lagged by {n}");
+impl NotificationDispatcher {
+    fn handle_message(&self, backend_pid: Option<i32>, message: AsyncMessage) {
+        match message {
+            AsyncMessage::Notification(msg) => {
+                log::debug!("Notification: {msg:?}");
+                if self.suppress_own_notifications && backend_pid == Some(msg.process_id()) {
+                    return;
+                }
+                dispatch_notification(
+                    msg.channel(),
+                    msg.payload(),
+                    msg.process_id(),
+                    &self.listener_map,
+                    &self.pending_unlisten,
+                    &self.cmd_tx,
+                );
+            }
+            // Notices (e.g. from DDL or RAISE NOTICE) are informational, not errors;
+            // they must not slow down or stop the message loop.
+            AsyncMessage::Notice(notice) => log::debug!("Database notice: {notice}"),
+            _ => {}
         }
     }
-    Either::Right(())
 }
 
-async fn poll_any<T>(
-    connection: &mut Connection<Socket, <T as MakeTlsConnect<Socket>>::Stream>,
-    disconnected_rx: &mut broadcast::Receiver<()>,
-) -> PollResult
+/// Everything the long-lived listener task needs to drive the connection and to
+/// re-establish it (including re-LISTENs) when it drops.
+pub(crate) struct ListenerTaskContext<T> {
+    pub dispatcher: NotificationDispatcher,
+    pub connection_params: ConnectionParameters,
+    pub tls: T,
+    pub pg_client: Arc<PgClient>,
+}
+
+/// Establishes a connection from the stored parameters.
+pub(crate) async fn raw_connect<T>(
+    params: &ConnectionParameters,
+    tls: T,
+) -> Result<(Client, Connection<Socket, T::Stream>), tokio_postgres::Error>
 where
     T: MakeTlsConnect<Socket>,
-    <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
 {
-    let f1 = Box::pin(poll_connection::<T>(connection));
-    let f2 = Box::pin(poll_disconnect(disconnected_rx));
-    (f1, f2).race().await
+    match params {
+        ConnectionParameters::ConnectionStr(s) => tokio_postgres::connect(s, tls).await,
+        ConnectionParameters::TokioPostgresConfig(cfg) => cfg.connect(tls).await,
+    }
 }
 
-/// Builds the connection listener future and, when `suppress_own_notifications` is true,
-/// also returns a oneshot sender used to deliver the backend PID to the listener.
+/// Drives `connection` (dispatching any messages that arrive) while concurrently
+/// awaiting `operation`, a client call pipelined on that same connection. The connection
+/// must be polled for the operation to make progress, and during connection setup no
+/// other task is doing so — hence this helper.
 ///
-/// The future drives the underlying tokio-postgres connection, so any query (including
-/// the `pg_backend_pid()` lookup that produces the PID) needs the future to be polled —
-/// typically by spawning it on the runtime — before it can complete.
-#[allow(clippy::too_many_arguments)] // Internal function, all args are necessary.
-pub(crate) fn create_listener_task<T>(
-    mut connection: Connection<Socket, <T as MakeTlsConnect<Socket>>::Stream>,
-    listener_map: Arc<DashMap<Box<str>, Listener>>,
-    pending_unlisten: Arc<DashSet<Box<str>>>,
-    cmd_tx: UnboundedSender<Command>,
-    suppress_own_notifications: bool,
-    mut backoff: ExponentialBackoff,
-    disconnected_sx: broadcast::Sender<()>,
-    mut disconnected_rx: broadcast::Receiver<()>,
+/// Returns the operation's result, plus the connection if it is still alive. If the
+/// connection dies before the operation completes, the connection is dropped, which
+/// makes the pending operation resolve (normally with a connection-closed error).
+pub(crate) async fn drive_while<S, F, O>(
+    connection: Connection<Socket, S>,
+    dispatcher: &NotificationDispatcher,
+    backend_pid: Option<i32>,
+    operation: F,
 ) -> (
-    impl Future<Output = Result<(), tokio_postgres::Error>>,
-    Option<oneshot::Sender<i32>>,
+    Result<O, tokio_postgres::Error>,
+    Option<Connection<Socket, S>>,
 )
 where
-    T: MakeTlsConnect<Socket>,
-    <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Future<Output = Result<O, tokio_postgres::Error>>,
 {
-    let (backend_pid_sx, mut backend_pid_rx) = if suppress_own_notifications {
-        let ch = oneshot::channel();
-        (Some(ch.0), Some(ch.1))
-    } else {
-        (None, None)
-    };
-
-    let handle = async move {
-        let mut backend_pid = None;
-
-        loop {
-            let poll_result = poll_any::<T>(&mut connection, &mut disconnected_rx).await;
-            let item = match poll_result {
-                Either::Left(None) => {
-                    log::debug!("End of connection stream, exiting connection listener");
-                    return Ok(());
+    let mut connection = connection;
+    tokio::pin!(operation);
+    let completed = loop {
+        tokio::select! {
+            result = &mut operation => break Some(result),
+            message = poll_fn(|cx| connection.poll_message(cx)) => match message {
+                Some(Ok(message)) => dispatcher.handle_message(backend_pid, message),
+                Some(Err(err)) => {
+                    log::warn!("Database connection error during setup: {err}");
+                    break None;
                 }
-                Either::Left(Some(item)) => item,
-                Either::Right(_) => {
-                    log::debug!("Listener thread received disconnect signal");
-                    return Ok(());
-                }
-            };
-
-            if !disconnected_rx.is_empty() {
-                log::debug!("Listener thread received disconnect signal");
-                return Ok(());
-            }
-
-            match item {
-                Ok(AsyncMessage::Notification(msg)) => {
-                    log::debug!("Notification: {msg:?}");
-                    backoff.reset();
-                    // Take the backend PID the first time we actually need it for suppression.
-                    // The sender drops without sending if connect() shuts down racily; fall back
-                    // to "don't suppress" in that case rather than panicking.
-                    if let Some(rx) = backend_pid_rx.take() {
-                        match rx.await {
-                            Ok(pid) => backend_pid = Some(pid),
-                            Err(_) => log::warn!(
-                                "Backend PID sender dropped; own-notification suppression disabled"
-                            ),
-                        }
-                    }
-                    if suppress_own_notifications && backend_pid == Some(msg.process_id()) {
-                        continue;
-                    }
-                    dispatch_notification(
-                        msg.channel(),
-                        msg.payload(),
-                        msg.process_id(),
-                        &listener_map,
-                        &pending_unlisten,
-                        &cmd_tx,
-                    );
-                }
-                Ok(AsyncMessage::Notice(db_error)) => {
-                    log::error!("PgListener got Notice: {db_error}");
-                    backoff.fail_and_sleep().await;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    log::error!("Terminating listener task because of: {err}");
-                    match disconnected_sx.send(()) {
-                        Ok(_) => log::debug!("Sending disconnect signal from listener task"),
-                        Err(e) => log::error!("Could not send disconnect signal: {e}"),
-                    };
-                    return Ok(());
+                None => {
+                    log::warn!("Database connection closed during setup");
+                    break None;
                 }
             }
         }
     };
+    match completed {
+        Some(result) => (result, Some(connection)),
+        None => {
+            drop(connection);
+            (operation.await, None)
+        }
+    }
+}
 
-    (handle, backend_pid_sx)
+/// Long-lived task that drives the PostgreSQL connection and dispatches incoming
+/// notifications to subscribers. When the connection dies it reconnects with exponential
+/// backoff (retrying indefinitely), re-establishes all active LISTENs, and swaps the new
+/// client into [`PgClient`] so queued commands and NOTIFYs target the new connection.
+///
+/// Notifications published by others while the connection is down are lost — NOTIFY is
+/// fire-and-forget and PostgreSQL keeps no backlog for disconnected listeners. The
+/// subscriptions themselves survive: once reconnected, their channels are LISTENed to
+/// again and delivery resumes. Client operations issued during the outage fail fast with
+/// a connection-closed error.
+pub(crate) async fn listener_task<T>(
+    mut connection: Option<Connection<Socket, T::Stream>>,
+    mut backend_pid: Option<i32>,
+    ctx: ListenerTaskContext<T>,
+) where
+    T: MakeTlsConnect<Socket> + Clone,
+    T::Stream: Send + 'static,
+{
+    loop {
+        if let Some(mut conn) = connection.take() {
+            // Drive the connection until it dies.
+            loop {
+                match poll_fn(|cx| conn.poll_message(cx)).await {
+                    Some(Ok(message)) => ctx.dispatcher.handle_message(backend_pid, message),
+                    Some(Err(err)) => {
+                        log::warn!("Database connection error: {err}; reconnecting");
+                        break;
+                    }
+                    None => {
+                        log::warn!("Database connection closed; reconnecting");
+                        break;
+                    }
+                }
+            }
+            // The dead connection is dropped here so that pending client operations
+            // fail fast during the outage instead of hanging.
+        }
+
+        let (client, new_connection, pid) = reconnect(&ctx).await;
+        // The new connection already has our LISTENs re-established (see
+        // `try_connect_and_setup`); publishing the client makes it visible to the
+        // funnel and to `notify()`.
+        ctx.pg_client.replace(client).await;
+        connection = new_connection;
+        backend_pid = pid;
+    }
+}
+
+/// Re-establishes the connection, retrying indefinitely with exponential backoff.
+async fn reconnect<T>(
+    ctx: &ListenerTaskContext<T>,
+) -> (Client, Option<Connection<Socket, T::Stream>>, Option<i32>)
+where
+    T: MakeTlsConnect<Socket> + Clone,
+    T::Stream: Send + 'static,
+{
+    let mut backoff = ExponentialBuilder::default()
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(Duration::from_secs(30))
+        .with_jitter()
+        .without_max_times()
+        .build();
+    loop {
+        match try_connect_and_setup(ctx).await {
+            Ok(connected) => {
+                log::info!("Reconnected to PostgreSQL");
+                return connected;
+            }
+            Err(err) => {
+                // The backoff has no retry limit, so next() is always Some.
+                let delay = backoff.next().unwrap_or(Duration::from_secs(30));
+                log::warn!("Reconnect attempt failed: {err}; next attempt in {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// One reconnect attempt: connect, fetch the backend PID (when own-notification
+/// suppression needs it), and re-LISTEN to every channel that currently has subscribers.
+/// Both setup steps run before the client is published via [`PgClient::replace`], so no
+/// other task can pipeline its own commands in front of them.
+///
+/// A `None` connection in the success case means the connection died right after the
+/// setup queries completed; the caller's drive loop notices immediately and retries.
+async fn try_connect_and_setup<T>(
+    ctx: &ListenerTaskContext<T>,
+) -> Result<(Client, Option<Connection<Socket, T::Stream>>, Option<i32>), tokio_postgres::Error>
+where
+    T: MakeTlsConnect<Socket> + Clone,
+    T::Stream: Send + 'static,
+{
+    let (client, connection) = raw_connect(&ctx.connection_params, ctx.tls.clone()).await?;
+    let mut connection = Some(connection);
+
+    let backend_pid = if ctx.dispatcher.suppress_own_notifications {
+        let conn = connection
+            .take()
+            .expect("connection is present before setup");
+        let (pid, conn) =
+            drive_while(conn, &ctx.dispatcher, None, fetch_backend_pid(&client)).await;
+        connection = conn;
+        Some(pid?)
+    } else {
+        None
+    };
+
+    if let Some(conn) = connection.take() {
+        let channels: Vec<Box<str>> = ctx
+            .dispatcher
+            .listener_map
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        if let Some(sql) = build_relisten_sql(channels.iter().map(AsRef::as_ref)) {
+            log::info!("Re-establishing LISTEN for {} channel(s)", channels.len());
+            let (result, conn) = drive_while(
+                conn,
+                &ctx.dispatcher,
+                backend_pid,
+                client.batch_execute(&sql),
+            )
+            .await;
+            result?;
+            connection = conn;
+        } else {
+            connection = Some(conn);
+        }
+    }
+
+    Ok((client, connection, backend_pid))
 }
 
 /// Routes a single notification to its broadcast channel if there's a listener entry, or
@@ -371,7 +463,7 @@ async fn process_command(
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use tokio::sync::mpsc;
+    use tokio::sync::{broadcast, mpsc};
 
     use super::*;
 

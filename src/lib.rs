@@ -36,13 +36,12 @@ pub use pg_pubsub_options::PgPubSubOptionsBuilder;
 
 pub mod tokio_postgres {
     //! Re-exports from `tokio_postgres` needed for connection configuration and TLS.
-    pub use tokio_postgres::tls::{MakeTlsConnect, NoTls};
+    pub use tokio_postgres::tls::{MakeTlsConnect, NoTls, TlsConnect};
     pub use tokio_postgres::Config;
     pub use tokio_postgres::Error;
     pub use tokio_postgres::Socket;
 }
 
-mod exponential_backoff;
 mod pg_client;
 mod pg_connection_listener;
 mod pg_pubsub;

@@ -1,17 +1,16 @@
-use crate::exponential_backoff::ExponentialBackoff;
-use crate::pg_connection_listener::{command_task, create_listener_task};
-use crate::tokio_postgres::{MakeTlsConnect, Socket};
+use crate::pg_connection_listener::{
+    command_task, drive_while, listener_task, raw_connect, ListenerTaskContext,
+    NotificationDispatcher,
+};
+use crate::tokio_postgres::{MakeTlsConnect, Socket, TlsConnect};
 use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use tokio_postgres::connect;
-
-use crate::pg_client::PgClient;
-use crate::pg_pubsub_options::{ConnectionParameters, PgPubSubOptions};
+use crate::pg_client::{fetch_backend_pid, PgClient};
+use crate::pg_pubsub_options::PgPubSubOptions;
 
 pub struct PgPubSubConnection {
     pg_client: Arc<PgClient>,
@@ -219,61 +218,65 @@ impl std::error::Error for PubSubError {
 }
 
 impl PgPubSubConnection {
-    /// Connects to PostgreSQL with the given parameters. A new Tokio asynchronous task will be
-    /// spawned in the background using the configuration of the current Tokio Runtime.
+    /// Connects to PostgreSQL with the given parameters. Two background tasks are spawned
+    /// on the current Tokio runtime: one drives the connection (reconnecting with
+    /// exponential backoff if it drops) and one processes LISTEN/UNLISTEN commands.
     pub(crate) async fn connect<T>(
         options: PgPubSubOptions<T>,
     ) -> Result<Self, tokio_postgres::Error>
     where
-        T: MakeTlsConnect<Socket> + Clone + Send + 'static,
+        T: MakeTlsConnect<Socket> + Clone + Send + Sync + 'static,
         <T as MakeTlsConnect<Socket>>::Stream: Send + 'static,
+        <T as MakeTlsConnect<Socket>>::TlsConnect: Send,
+        <<T as MakeTlsConnect<Socket>>::TlsConnect as TlsConnect<Socket>>::Future: Send,
     {
-        let backoff = ExponentialBackoff::with_backoff(
-            Duration::from_millis(100),
-            Duration::from_secs(30),
-            1.8,
-        );
+        let PgPubSubOptions {
+            connection_params,
+            channel_capacity,
+            suppress_own_notifications,
+            tls,
+        } = options;
 
-        let (client, connection) = match options.connection_params {
-            ConnectionParameters::ConnectionStr(s) => connect(&s, options.tls).await?,
-            ConnectionParameters::TokioPostgresConfig(cfg) => cfg.connect(options.tls).await?,
-        };
+        let (client, connection) = raw_connect(&connection_params, tls.clone()).await?;
 
         let listener_map: Arc<DashMap<Box<str>, Listener>> = Default::default();
         let pending_unlisten: Arc<DashSet<Box<str>>> = Default::default();
-        let (disconnected_sx, disconnected_rx) = broadcast::channel(1);
-
-        let pg_client = Arc::new(PgClient::new(client));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        let (listener_future, backend_pid_sx) = create_listener_task::<T>(
-            connection,
-            Arc::clone(&listener_map),
-            Arc::clone(&pending_unlisten),
-            cmd_tx.clone(),
-            options.suppress_own_notifications,
-            backoff,
-            disconnected_sx,
-            disconnected_rx,
-        );
+        let dispatcher = NotificationDispatcher {
+            listener_map: Arc::clone(&listener_map),
+            pending_unlisten: Arc::clone(&pending_unlisten),
+            cmd_tx: cmd_tx.clone(),
+            suppress_own_notifications,
+        };
 
-        // JoinSet aborts its tasks on drop, so any early return from this function
-        // (e.g. get_pid failure) cleans up the spawned listener.
+        // Resolve the backend PID for own-notification suppression before anything else
+        // can issue commands on this connection: we drive the connection ourselves while
+        // the query runs and the client is not shared yet, so no notification can slip
+        // through unfiltered. A `None` connection here means it died right after
+        // answering; the listener task notices and reconnects immediately.
+        let (backend_pid, connection) = if suppress_own_notifications {
+            let (pid, connection) =
+                drive_while(connection, &dispatcher, None, fetch_backend_pid(&client)).await;
+            (Some(pid?), connection)
+        } else {
+            (None, Some(connection))
+        };
+
+        let pg_client = Arc::new(PgClient::new(client));
+
+        // JoinSet aborts its tasks on drop, which ties both background tasks to the
+        // lifetime of this handle. Dropping it also drops `listener_map`'s broadcast
+        // senders, which is what makes `Subscription::recv` return `Closed`.
         let mut tasks: JoinSet<()> = JoinSet::new();
 
-        // Spawn the connection polling loop first so subsequent queries are driven.
-        tasks.spawn(async move {
-            if let Err(err) = listener_future.await {
-                log::error!("Listener task exited with error: {err}");
-            }
-        });
-
-        if let Some(pid_sx) = backend_pid_sx {
-            let pid = pg_client.get_pid().await?;
-            if pid_sx.send(pid).is_err() {
-                log::warn!("Listener exited before backend PID was sent");
-            }
-        }
+        let ctx = ListenerTaskContext {
+            dispatcher,
+            connection_params,
+            tls,
+            pg_client: Arc::clone(&pg_client),
+        };
+        tasks.spawn(listener_task(connection, backend_pid, ctx));
 
         let cmd_pg_client = Arc::clone(&pg_client);
         let cmd_listener_map = Arc::clone(&listener_map);
@@ -284,7 +287,7 @@ impl PgPubSubConnection {
         Ok(PgPubSubConnection {
             pg_client,
             listeners: listener_map,
-            channel_capacity: options.channel_capacity,
+            channel_capacity,
             cmd_tx,
             tasks,
         })
