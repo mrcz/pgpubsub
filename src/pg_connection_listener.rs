@@ -285,7 +285,10 @@ pub(crate) fn dispatch_notification(
             process_id,
         };
         if let Err(err) = sender.send_channel.send(notification) {
-            log::error!("Error when sending on channel {channel}: {err}");
+            // Benign teardown race: the last Subscription was just dropped (taking the
+            // last receiver with it) but its Unsub is still queued in the funnel, so the
+            // map entry is still present when this notification arrives.
+            log::debug!("No receivers for notification on channel {channel}: {err}");
         }
     } else {
         let key: Box<str> = channel.into();
@@ -417,12 +420,22 @@ async fn process_command(
             let should_unlisten = match listener_map.entry(channel.clone()) {
                 Entry::Occupied(occ) => {
                     let prev = occ.get().listener_count.fetch_sub(1, Ordering::AcqRel);
-                    assert!(prev > 0);
-                    if prev == 1 {
-                        occ.remove();
-                        true
-                    } else {
-                        false
+                    debug_assert!(prev > 0, "Unsub underflow for channel {channel}");
+                    match prev {
+                        // Refcount underflow would mean an Unsub without a matching
+                        // listen(). It should be unreachable, but panicking here would
+                        // silently kill the funnel and with it all of LISTEN/UNLISTEN
+                        // processing — undo the decrement and carry on instead.
+                        0 => {
+                            occ.get().listener_count.fetch_add(1, Ordering::AcqRel);
+                            log::warn!("Unsub for channel {channel} with zero listeners; ignoring");
+                            false
+                        }
+                        1 => {
+                            occ.remove();
+                            true
+                        }
+                        _ => false,
                     }
                 }
                 Entry::Vacant(_) => {
