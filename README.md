@@ -65,6 +65,17 @@ Then send a notification from another terminal:
 docker exec -it example-postgres-1 psql -U auth -c "NOTIFY my_channel, 'hello world'"
 ```
 
+## Running the tests
+
+Unit tests run with plain `cargo test`. The integration tests (round-trip delivery,
+batch atomicity, own-notification suppression, and reconnect-after-backend-termination)
+need the docker-compose database and are ignored by default:
+
+```sh
+docker compose -f example/docker-compose.yml up -d
+cargo test -- --ignored
+```
+
 ## Connection options
 
 Connect with individual parameters:
