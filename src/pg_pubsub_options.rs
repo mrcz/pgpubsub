@@ -120,13 +120,15 @@ impl<'a> LibpqValue<'a> {
             };
         }
 
-        let mut contains_spaces = false;
+        // Any whitespace (not just ' ') would otherwise be taken as a key-value
+        // separator by the libpq-style parser, so all of it forces quoting.
+        let mut needs_quoting = false;
         let mut escape_count = 0;
         for ch in input.chars() {
-            contains_spaces |= ch == ' ';
+            needs_quoting |= ch.is_whitespace();
             escape_count += (ch == '\\' || ch == '\'') as usize;
         }
-        if escape_count == 0 && !contains_spaces {
+        if escape_count == 0 && !needs_quoting {
             return LibpqValue {
                 value: Either::Right(input),
             };
@@ -135,12 +137,12 @@ impl<'a> LibpqValue<'a> {
         let output_len = input
             .len()
             .checked_add(escape_count)
-            .and_then(|len| len.checked_add(2 * contains_spaces as usize))
+            .and_then(|len| len.checked_add(2 * needs_quoting as usize))
             .expect("Escaped String will exceed the maximum length");
 
         let mut output = String::with_capacity(output_len);
 
-        if contains_spaces {
+        if needs_quoting {
             output.push('\'');
         }
 
@@ -155,7 +157,7 @@ impl<'a> LibpqValue<'a> {
             }
         }
 
-        if contains_spaces {
+        if needs_quoting {
             output.push('\'');
         }
 
@@ -218,6 +220,15 @@ mod test {
     }
 
     #[test]
+    fn lib_pq_value_quotes_all_whitespace_not_just_spaces() {
+        // Tabs and newlines are also key-value separators for the libpq-style parser;
+        // leaving them unquoted would split the value.
+        assert_eq!(LibpqValue::from_str("a\tb").as_str(), "'a\tb'");
+        assert_eq!(LibpqValue::from_str("a\nb").as_str(), "'a\nb'");
+        assert_eq!(LibpqValue::from_str("a\u{a0}b").as_str(), "'a\u{a0}b'");
+    }
+
+    #[test]
     fn lib_pq_value_fmt_empty_is_quoted() {
         let v = LibpqValue::from_str("");
         // Empty values must be wrapped in '' so libpq parses them as explicit empty rather
@@ -250,5 +261,33 @@ mod test {
         let expected = r#"host=\\\\PGHOST\\ dbname=databasename user=user password='1j( \\\'9f'"#;
 
         assert_eq!(con_str, expected);
+    }
+
+    /// The authoritative check: whatever we build must survive a round-trip through the
+    /// actual `tokio_postgres::Config` parser, including whitespace, quotes, and
+    /// backslashes in the values.
+    #[test]
+    fn built_connection_string_round_trips_through_config() {
+        let host = "some host";
+        let dbname = "data base";
+        let user = "user'name";
+        let password = "we ird\tpass\\'word\nx";
+        let con_str = PgPubSubOptionsBuilder::build_connection_string(host, dbname, user, password);
+
+        let config: Config = con_str.parse().expect("config should parse");
+        assert_eq!(
+            config.get_hosts(),
+            &[tokio_postgres::config::Host::Tcp(host.to_owned())]
+        );
+        assert_eq!(config.get_dbname(), Some(dbname));
+        assert_eq!(config.get_user(), Some(user));
+        assert_eq!(config.get_password(), Some(password.as_bytes()));
+    }
+
+    #[test]
+    fn empty_password_round_trips_through_config() {
+        let con_str = PgPubSubOptionsBuilder::build_connection_string("h", "db", "u", "");
+        let config: Config = con_str.parse().expect("config should parse");
+        assert_eq!(config.get_password(), Some(&b""[..]));
     }
 }
