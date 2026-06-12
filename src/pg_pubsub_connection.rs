@@ -164,7 +164,10 @@ impl std::error::Error for RecvError {}
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        log::debug!("Unsubscribing from channel {channel}", channel = self.channel);
+        log::debug!(
+            "Unsubscribing from channel {channel}",
+            channel = self.channel
+        );
         let channel = std::mem::take(&mut self.channel);
         if let Err(err) = self.cmd_tx.send(Command::Unsub { channel }) {
             log::error!("Error when unsubscribing: {err}");
@@ -363,14 +366,10 @@ impl PgPubSubConnection {
         self.notify_cmd(channel, payload).await
     }
 
-    pub async fn notify_batch(
-        &self,
-        items: &[(&str, Option<&str>)],
-    ) -> Result<(), PubSubError> {
+    pub async fn notify_batch(&self, items: &[(&str, Option<&str>)]) -> Result<(), PubSubError> {
         // Validate every channel up-front so a bad name never produces a partial
-        // commit — the SQL we'd build wraps the batch in BEGIN; ... COMMIT;, but
-        // catching it before we send is still better than letting Postgres reject it
-        // mid-batch.
+        // commit — the batch runs in one implicit transaction, but catching it before
+        // we send is still better than letting Postgres reject it mid-batch.
         for (channel, _) in items {
             if !valid_channel_name(channel) {
                 return Err(PubSubError::InvalidChannelName);
@@ -393,7 +392,6 @@ impl PgPubSubConnection {
             .await
             .map_err(PubSubError::NotifyError)
     }
-
 }
 
 /// PostgreSQL truncates identifiers (including LISTEN/NOTIFY channel names) to 63 bytes,

@@ -414,11 +414,21 @@ mod tests {
     fn unknown_channel_enqueues_unlisten_if_empty() {
         let mut f = fixture();
 
-        dispatch_notification("foo", "data", 42, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification(
+            "foo",
+            "data",
+            42,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
 
         match f.cmd_rx.try_recv().expect("expected one command queued") {
             Command::UnlistenIfEmpty { channel } => assert_eq!(&*channel, "foo"),
-            other => panic!("unexpected command queued: {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "unexpected command queued: {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         assert!(f.pending_unlisten.contains("foo"));
         assert!(f.cmd_rx.try_recv().is_err(), "no further commands expected");
@@ -429,12 +439,22 @@ mod tests {
         let mut f = fixture();
 
         for _ in 0..5 {
-            dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+            dispatch_notification(
+                "foo",
+                "data",
+                1,
+                &f.listener_map,
+                &f.pending_unlisten,
+                &f.cmd_tx,
+            );
         }
 
         // Exactly one UnlistenIfEmpty even though five stray notifications arrived: the
         // dedupe set blocks subsequent enqueues until the funnel processes the first one.
-        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+        assert!(matches!(
+            f.cmd_rx.try_recv(),
+            Ok(Command::UnlistenIfEmpty { .. })
+        ));
         assert!(f.cmd_rx.try_recv().is_err());
         assert!(f.pending_unlisten.contains("foo"));
     }
@@ -443,15 +463,35 @@ mod tests {
     fn unknown_channel_re_enqueues_after_dedupe_clear() {
         let mut f = fixture();
 
-        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
-        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+        dispatch_notification(
+            "foo",
+            "data",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
+        assert!(matches!(
+            f.cmd_rx.try_recv(),
+            Ok(Command::UnlistenIfEmpty { .. })
+        ));
 
         // Funnel processed the first UnlistenIfEmpty and cleared the dedupe slot. A new
         // stray notification should be able to enqueue again.
         f.pending_unlisten.remove("foo");
 
-        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
-        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+        dispatch_notification(
+            "foo",
+            "data",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
+        assert!(matches!(
+            f.cmd_rx.try_recv(),
+            Ok(Command::UnlistenIfEmpty { .. })
+        ));
     }
 
     #[test]
@@ -459,7 +499,14 @@ mod tests {
         let mut f = fixture();
         let mut receiver = insert_listener(&f.listener_map, "foo", 1);
 
-        dispatch_notification("foo", "hello", 7, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification(
+            "foo",
+            "hello",
+            7,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
 
         let n = receiver.try_recv().expect("notification was not broadcast");
         assert_eq!(&*n.channel, "foo");
@@ -480,7 +527,14 @@ mod tests {
         let mut f = fixture();
         let mut receiver = insert_listener(&f.listener_map, "foo", 1);
 
-        dispatch_notification("foo", "hi", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification(
+            "foo",
+            "hi",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
 
         assert!(receiver.try_recv().is_ok());
         assert!(f.cmd_rx.try_recv().is_err());
@@ -496,8 +550,18 @@ mod tests {
         // funnel will see.
         let mut f = fixture();
 
-        dispatch_notification("foo", "hi", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
-        assert!(matches!(f.cmd_rx.try_recv(), Ok(Command::UnlistenIfEmpty { .. })));
+        dispatch_notification(
+            "foo",
+            "hi",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
+        assert!(matches!(
+            f.cmd_rx.try_recv(),
+            Ok(Command::UnlistenIfEmpty { .. })
+        ));
         assert!(f.pending_unlisten.contains("foo"));
 
         // listen() inserts the entry concurrently.
@@ -515,7 +579,14 @@ mod tests {
         // Drop the receiver to simulate the funnel having exited.
         drop(f.cmd_rx);
 
-        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification(
+            "foo",
+            "data",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
 
         // The dedupe slot must be rolled back so the placeholder doesn't outlive the
         // failed enqueue. (The funnel never receives anything anyway.)
@@ -529,8 +600,22 @@ mod tests {
         // produce two distinct UnlistenIfEmpty commands and two distinct dedupe entries.
         let mut f = fixture();
 
-        dispatch_notification("foo", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
-        dispatch_notification("bar", "data", 1, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification(
+            "foo",
+            "data",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
+        dispatch_notification(
+            "bar",
+            "data",
+            1,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
 
         let mut channels: Vec<String> = Vec::new();
         while let Ok(cmd) = f.cmd_rx.try_recv() {
@@ -552,7 +637,14 @@ mod tests {
         let f = fixture();
         let mut receiver = insert_listener(&f.listener_map, "foo", 1);
 
-        dispatch_notification("foo", "", 9, &f.listener_map, &f.pending_unlisten, &f.cmd_tx);
+        dispatch_notification(
+            "foo",
+            "",
+            9,
+            &f.listener_map,
+            &f.pending_unlisten,
+            &f.cmd_tx,
+        );
 
         let n = receiver.try_recv().expect("notification was not broadcast");
         assert_eq!(&*n.channel, "foo");

@@ -39,16 +39,13 @@ impl PgPubSub {
         self.connection.notify(channel, payload).await
     }
 
-    /// Sends a batch of NOTIFY commands in a single round-trip, wrapped in a transaction
-    /// so the entire batch is delivered atomically (either every notification reaches
-    /// subscribers or none of them do). Empty input is a no-op.
+    /// Sends a batch of NOTIFY commands in a single round-trip. The batch executes in
+    /// one implicit transaction, so it is delivered atomically (either every
+    /// notification reaches subscribers or none of them do). Empty input is a no-op.
     ///
     /// Useful when one publisher fans out many notifications quickly: each call is one
     /// round-trip rather than N.
-    pub async fn notify_batch(
-        &self,
-        items: &[(&str, Option<&str>)],
-    ) -> Result<(), PubSubError> {
+    pub async fn notify_batch(&self, items: &[(&str, Option<&str>)]) -> Result<(), PubSubError> {
         self.connection.notify_batch(items).await
     }
 }
