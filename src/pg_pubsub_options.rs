@@ -57,9 +57,12 @@ impl PgPubSubOptionsBuilder {
     }
 
     /// Sets the per-channel capacity of the broadcast channel that delivers notifications.
+    ///
+    /// A capacity of 0 is treated as 1 (`tokio`'s broadcast channel panics on a zero
+    /// capacity, and a subscription that can never receive anything is meaningless).
     pub fn channel_capacity(self, channel_capacity: usize) -> Self {
         Self {
-            channel_capacity,
+            channel_capacity: channel_capacity.max(1),
             ..self
         }
     }
@@ -220,6 +223,20 @@ mod test {
         // Empty values must be wrapped in '' so libpq parses them as explicit empty rather
         // than treating the key as missing.
         assert_eq!(v.as_str(), "''");
+    }
+
+    #[test]
+    fn zero_channel_capacity_is_clamped_to_one() {
+        // tokio's broadcast::channel panics on capacity 0; the clamp keeps that panic
+        // from surfacing later, deep inside the first listen() call.
+        let builder = PgPubSubOptionsBuilder::new("h", "d", "u", "p").channel_capacity(0);
+        assert_eq!(builder.channel_capacity, 1);
+    }
+
+    #[test]
+    fn nonzero_channel_capacity_is_kept() {
+        let builder = PgPubSubOptionsBuilder::new("h", "d", "u", "p").channel_capacity(16);
+        assert_eq!(builder.channel_capacity, 16);
     }
 
     #[test]
