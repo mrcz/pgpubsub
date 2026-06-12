@@ -35,6 +35,9 @@ impl PgPubSub {
     }
 
     /// Sends a NOTIFY on the given channel with an optional payload.
+    ///
+    /// The payload must be shorter than 8000 bytes (PostgreSQL's limit); longer payloads
+    /// are rejected with [`PubSubError::InvalidPayload`] without contacting the server.
     pub async fn notify(&self, channel: &str, payload: Option<&str>) -> Result<(), PubSubError> {
         self.connection.notify(channel, payload).await
     }

@@ -181,6 +181,8 @@ impl Drop for Subscription {
 pub enum PubSubError {
     /// Channel name is empty or exceeds 63 bytes.
     InvalidChannelName,
+    /// Notification payload is 8000 bytes or longer, which PostgreSQL rejects.
+    InvalidPayload,
     /// The LISTEN command sent for [`PgPubSub::listen`](crate::PgPubSub::listen) failed.
     ListenError(tokio_postgres::Error),
     /// The NOTIFY command sent for [`PgPubSub::notify`](crate::PgPubSub::notify) or
@@ -195,6 +197,9 @@ impl std::fmt::Display for PubSubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PubSubError::InvalidChannelName => write!(f, "invalid channel name"),
+            PubSubError::InvalidPayload => {
+                write!(f, "notification payload must be shorter than 8000 bytes")
+            }
             PubSubError::ListenError(e) => write!(f, "LISTEN command failed: {e}"),
             PubSubError::NotifyError(e) => write!(f, "NOTIFY command failed: {e}"),
             PubSubError::Closed => write!(f, "PgPubSub connection closed"),
@@ -206,7 +211,9 @@ impl std::error::Error for PubSubError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PubSubError::ListenError(e) | PubSubError::NotifyError(e) => Some(e),
-            PubSubError::InvalidChannelName | PubSubError::Closed => None,
+            PubSubError::InvalidChannelName | PubSubError::InvalidPayload | PubSubError::Closed => {
+                None
+            }
         }
     }
 }
@@ -363,16 +370,22 @@ impl PgPubSubConnection {
         if !valid_channel_name(channel) {
             return Err(PubSubError::InvalidChannelName);
         }
+        if !valid_payload(payload) {
+            return Err(PubSubError::InvalidPayload);
+        }
         self.notify_cmd(channel, payload).await
     }
 
     pub async fn notify_batch(&self, items: &[(&str, Option<&str>)]) -> Result<(), PubSubError> {
-        // Validate every channel up-front so a bad name never produces a partial
-        // commit — the batch runs in one implicit transaction, but catching it before
-        // we send is still better than letting Postgres reject it mid-batch.
-        for (channel, _) in items {
+        // Validate every channel and payload up-front so a bad item never produces a
+        // partial commit — the batch runs in one implicit transaction, but catching it
+        // before we send is still better than letting Postgres reject it mid-batch.
+        for (channel, payload) in items {
             if !valid_channel_name(channel) {
                 return Err(PubSubError::InvalidChannelName);
+            }
+            if !valid_payload(*payload) {
+                return Err(PubSubError::InvalidPayload);
             }
         }
         log::debug!("Notifying batch of {} items", items.len());
@@ -400,6 +413,13 @@ impl PgPubSubConnection {
 /// truncation.
 fn valid_channel_name(channel: &str) -> bool {
     (1..=63).contains(&channel.len())
+}
+
+/// PostgreSQL requires NOTIFY payloads to be shorter than 8000 bytes (with the default
+/// build configuration). Validate before sending so the caller gets a clear
+/// `InvalidPayload` instead of a server error.
+fn valid_payload(payload: Option<&str>) -> bool {
+    payload.is_none_or(|p| p.len() < 8000)
 }
 
 #[cfg(test)]
@@ -485,5 +505,18 @@ mod tests {
         assert!(!valid_channel_name(""));
         assert!(!valid_channel_name(&"a".repeat(64)));
         assert!(!valid_channel_name(&"a".repeat(1000)));
+    }
+
+    #[test]
+    fn valid_payload_accepts_none_empty_and_up_to_7999_bytes() {
+        assert!(valid_payload(None));
+        assert!(valid_payload(Some("")));
+        assert!(valid_payload(Some(&"a".repeat(7999))));
+    }
+
+    #[test]
+    fn valid_payload_rejects_8000_bytes_and_above() {
+        assert!(!valid_payload(Some(&"a".repeat(8000))));
+        assert!(!valid_payload(Some(&"a".repeat(100_000))));
     }
 }
